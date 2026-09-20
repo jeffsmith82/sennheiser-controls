@@ -1,0 +1,11 @@
+# Copied to .cargo/config.toml by the Flatpak build (see the manifest's
+# build-commands) so `cargo build --offline` resolves crates from the
+# pre-vendored `vendor/` directory instead of the network, which the
+# flatpak-builder sandbox doesn't have during the build phase. Not used by
+# an ordinary `cargo build` outside Flatpak - that still hits crates.io
+# normally, since this file never touches the repo's real .cargo/config.toml.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

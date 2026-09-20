@@ -1,0 +1,34 @@
+[package]
+name = "sennheiser-controls-gui"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[[bin]]
+name = "sennheiser-controls-gui"
+path = "src/main.rs"
+
+[dependencies]
+sennheiser-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+# Slint's default "accessibility" feature pulls in atspi-common, which uses
+# a #[validate(...)] proc-macro (zbus_lockstep_macros) that connects to a
+# live D-Bus session bus at COMPILE time to check signal signatures against
+# real introspection data. That works on an ordinary desktop but fails
+# (silently corrupting the macro expansion into "cannot find type ObjectRef"
+# errors) in a sandboxed build with no session bus, like a Flatpak build -
+# confirmed live: the same crate compiled fine locally, in both debug and
+# release, and only failed inside flatpak-builder. Disabling just this one
+# default feature avoids the whole chain; nothing else here uses it.
+slint = { version = "1", default-features = false, features = [
+    "std",
+    "backend-default",
+    "renderer-femtovg",
+    "renderer-software",
+    "compat-1-2",
+    "system-tray",
+] }
+
+[build-dependencies]
+slint-build = "1"

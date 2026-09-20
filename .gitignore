@@ -19,3 +19,16 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# `cargo vendor vendor` output, used only for offline Flatpak builds (see
+# flatpak/*.yml) - regenerate locally rather than committing ~1GB of
+# dependency source.
+/vendor/
+
+# flatpak-builder's own build cache/output - each already carries its own
+# internal .gitignore, these entries are just for clarity.
+/.flatpak-builder/
+/build-dir/
+
+# Personal Claude Code permission allowlist, not meant to be shared.
+.claude/settings.local.json

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Sennheiser Controls
+Comment=Control ANC, EQ, and other GAIA settings on Sonova/Sennheiser headphones
+Exec=sennheiser-controls-gui
+Icon=io.github.jeffreysmith.SennheiserControls
+Categories=Utility;AudioVideo;
+Terminal=false

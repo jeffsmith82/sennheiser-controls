@@ -1,0 +1,61 @@
+id: io.github.jeffreysmith.SennheiserControls
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: sennheiser-controls-gui
+
+finish-args:
+  # GUI window (Wayland, with X11 fallback) and clipboard/shared-memory
+  # support the fallback needs.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # GPU-accelerated rendering (Slint's winit/femtovg backend).
+  - --device=dri
+  # bluer/zbus only ever use the D-Bus *system* bus (BlueZ lives there) -
+  # see core/src/bluez.rs and core/src/transport.rs. No session-bus access
+  # is needed at all.
+  - --system-talk-name=org.bluez
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/sennheiser-controls-gui/cargo-home
+
+modules:
+  - name: sennheiser-controls-gui
+    buildsystem: simple
+    build-commands:
+      - mkdir -p .cargo
+      - cp cargo-config-offline.toml .cargo/config.toml
+      - cargo build --offline --release -p sennheiser-controls-gui
+      - install -Dm755 target/release/sennheiser-controls-gui /app/bin/sennheiser-controls-gui
+      - install -Dm644 io.github.jeffreysmith.SennheiserControls.desktop
+        /app/share/applications/io.github.jeffreysmith.SennheiserControls.desktop
+      - install -Dm644 io.github.jeffreysmith.SennheiserControls.svg
+        /app/share/icons/hicolor/scalable/apps/io.github.jeffreysmith.SennheiserControls.svg
+    sources:
+      - type: file
+        path: ../Cargo.toml
+      - type: file
+        path: ../Cargo.lock
+      - type: dir
+        path: ../core
+        dest: core
+      - type: dir
+        path: ../cli
+        dest: cli
+      - type: dir
+        path: ../gui
+        dest: gui
+      - type: dir
+        path: ../vendor
+        dest: vendor
+      - type: file
+        path: cargo-config-offline.toml
+      - type: file
+        path: io.github.jeffreysmith.SennheiserControls.desktop
+      - type: file
+        path: io.github.jeffreysmith.SennheiserControls.svg

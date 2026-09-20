@@ -1,0 +1,397 @@
+import { Button, ComboBox, Slider, Switch, GroupBox, LineEdit, TextEdit, ScrollView, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    title: "Sennheiser Controls";
+    preferred-width: 900px;
+    preferred-height: 700px;
+
+    // --- Device state, set from Rust ---
+    in property <[string]> device-names: [];
+    in-out property <int> selected-device-index: -1;
+    in property <bool> gaia-connected: false;
+    in property <string> connection-status: "Not connected";
+    in property <string> transport-kind: "classic"; // "classic" | "ble"
+
+    in property <string> volume-text: "-";
+    // in-out + `<=>` below rather than a one-way `value: root.volume-value`
+    // binding: the Slider's own drag/keyboard handling writes to its `value`
+    // property directly, which would otherwise permanently sever a one-way
+    // binding the first time the user drags it, leaving the slider stuck and
+    // no longer reflecting volume changes made via the +/-/Refresh buttons.
+    // A two-way alias keeps them as a single shared value instead.
+    in-out property <float> volume-value: 0;
+    in property <string> battery-text: "-";
+
+    in property <[string]> eq-preset-names: [];
+    // Set from Rust when the live band-1-4 snapshot (see
+    // spawn_gaia_notification_listener in gui/src/main.rs) uniquely matches
+    // a known preset's bands 1-4 - band 0 isn't reported by that push, so
+    // this is a best-effort fingerprint match, not a real "get current
+    // preset" query (no such opcode is known). Left alone (not reset to 0)
+    // when a live update doesn't match anything, so it doesn't fight the
+    // combo box the user is actively choosing from.
+    in-out property <int> eq-preset-index: 0;
+    // Five discrete properties rather than one `[int]` array: like
+    // volume-value above, each band's Slider needs a two-way `<=>` binding
+    // so drags and preset/Rust-driven updates share one storage cell
+    // instead of a one-way binding that a drag would sever. Two-way
+    // bindings alias a plain property path, not an array-index expression,
+    // hence one property per band rather than `eq-band-gains[i]`.
+    in-out property <float> eq-band-0: 0;
+    in-out property <float> eq-band-1: 0;
+    in-out property <float> eq-band-2: 0;
+    in-out property <float> eq-band-3: 0;
+    in-out property <float> eq-band-4: 0;
+    // dB-formatted display text for each band above, computed in Rust (see
+    // eq_gain_db_label in gui/src/main.rs) - a raw/10 scale that isn't worth
+    // reimplementing in Slint expressions just for the sign/decimal formatting.
+    in property <string> eq-band-0-label: "0.0dB";
+    in property <string> eq-band-1-label: "0.0dB";
+    in property <string> eq-band-2-label: "0.0dB";
+    in property <string> eq-band-3-label: "0.0dB";
+    in property <string> eq-band-4-label: "0.0dB";
+
+    // Auto-queried on connect via each command's explicit "get" opcode (ANC's
+    // is unverified - see core/src/gaia.rs docs - so its text is
+    // best-effort; Multipoint's is verified). This is separate from, and
+    // older than, the live push-notification feed below: right after
+    // connecting, Rust also registers this connection for live state
+    // updates (`commands::register_for_live_status`) - without that
+    // explicit step the headset pushes nothing at all, ever. Once
+    // registered, it pushes the current value immediately and again on
+    // every later change (including from its own physical buttons), which
+    // is what keeps anc-selected/noise-control-percent/bass-boost-on/
+    // anti-wind-on/multipoint-on updated live from Rust from here on - see
+    // `spawn_gaia_notification_listener` in gui/src/main.rs.
+    in property <string> anc-status-text: "unknown";
+    in property <string> multipoint-status-text: "unknown";
+
+    // ANC/Transparency crossfade slider, revealed by the ANC panel's
+    // "Custom" button. Two-way bound like volume-value/eq-band-* above so
+    // drags and any future external update (from a click here, or a live
+    // push notification) stay in sync.
+    in-out property <float> noise-control-percent: 50;
+    // `in-out`, not local UI state: the live notification listener reveals
+    // this automatically when the headset reports its physical
+    // ANC/Transparency button engaging Custom mode.
+    in-out property <bool> anc-custom-visible: false;
+    // Which ANC button is highlighted ("off" / "adaptive" / "custom" / "" =
+    // none yet). `in-out`: driven both by local button clicks and by live
+    // push notifications reflecting the device's actual current mode,
+    // including changes made via the headset's own physical buttons.
+    in-out property <string> anc-selected: "";
+
+    // Which Crossfeed button is highlighted ("off" / "low" / "high" / "" =
+    // not yet queried). `in-out`, same reasoning as anc-selected: driven by
+    // local clicks, the connect-time status query, and (if it's ever
+    // confirmed to push live - see gaia::RSP_SONOVA_CROSSFEED_GET docs) the
+    // notification listener too.
+    in-out property <string> crossfeed-selected: "";
+
+    function leave-custom-anc() {
+        root.anc-custom-visible = false;
+        // Anti-wind only makes sense alongside the custom crossfade - force
+        // it off whenever Custom mode is left, whether via its own button
+        // or by picking Off/Adaptive instead.
+        root.anti-wind-on = false;
+        root.anti-wind-set(false);
+    }
+
+    // Toggle state for the switch-style controls. None of these have an
+    // explicit "get" opcode, but all three are kept in sync with the device
+    // via the live push-notification feed (see the comment on
+    // anc-status-text above) in addition to reflecting whatever was last
+    // sent from this UI.
+    in-out property <bool> bass-boost-on: false;
+    in-out property <bool> anti-wind-on: false;
+    in-out property <bool> multipoint-on: false;
+
+    // --- Callbacks into Rust ---
+    callback refresh-devices();
+    callback device-selected(int);
+    callback set-transport(string);
+    callback connect-gaia();
+    callback disconnect-gaia();
+
+    callback refresh-volume();
+    callback set-volume(int);
+    callback volume-step(int);
+    callback refresh-battery-bluez();
+    callback refresh-battery-btleplug();
+
+    callback anc-status();
+    callback anc-set(bool);
+    callback bass-boost-set(bool);
+    callback eq-preset-apply(string);
+    callback crossfeed-set(string);
+    callback anti-wind-set(bool);
+    callback multipoint-set(bool);
+    callback multipoint-status();
+    callback noise-control-apply(int);
+    callback raw-gaia-send(string, string, string, string);
+
+    in-out property <string> log-text: "";
+
+    // Pure UI state, never touched from Rust - just collapses the raw-GAIA
+    // and log panels out of the way for normal use.
+    property <bool> advanced-visible: false;
+
+    VerticalBox {
+        padding: 10px;
+        spacing: 8px;
+
+        GroupBox {
+            title: "Device";
+            VerticalBox {
+                HorizontalBox {
+                    ComboBox {
+                        model: root.device-names;
+                        current-index <=> root.selected-device-index;
+                        selected(value) => { root.device-selected(root.selected-device-index); }
+                    }
+                    Button { text: "Refresh"; clicked => { root.refresh-devices(); } }
+                }
+                HorizontalBox {
+                    Text { text: "Transport:"; vertical-alignment: center; }
+                    Button {
+                        text: "Classic";
+                        clicked => { root.set-transport("classic"); }
+                    }
+                    Button {
+                        text: "BLE";
+                        clicked => { root.set-transport("ble"); }
+                    }
+                    Text { text: "(" + root.transport-kind + ")"; vertical-alignment: center; }
+                }
+                HorizontalBox {
+                    Button {
+                        text: root.gaia-connected ? "Disconnect" : "Connect";
+                        clicked => {
+                            if (root.gaia-connected) {
+                                root.disconnect-gaia();
+                            } else {
+                                root.connect-gaia();
+                            }
+                        }
+                    }
+                    Text { text: root.connection-status; vertical-alignment: center; }
+                }
+            }
+        }
+
+        HorizontalBox {
+            GroupBox {
+                title: "Volume";
+                VerticalBox {
+                    Text { text: root.volume-text; }
+                    Slider {
+                        minimum: 0;
+                        maximum: 127;
+                        value <=> root.volume-value;
+                        changed(value) => { root.set-volume(round(value)); }
+                    }
+                    HorizontalBox {
+                        Button { text: "-8"; clicked => { root.volume-step(-8); } }
+                        Button { text: "+8"; clicked => { root.volume-step(8); } }
+                        Button { text: "Refresh"; clicked => { root.refresh-volume(); } }
+                    }
+                }
+            }
+
+            GroupBox {
+                title: "Battery";
+                VerticalBox {
+                    Text { text: root.battery-text; }
+                    HorizontalBox {
+                        Button { text: "Refresh (bluez)"; clicked => { root.refresh-battery-bluez(); } }
+                        Button { text: "Refresh (btleplug)"; clicked => { root.refresh-battery-btleplug(); } }
+                    }
+                }
+            }
+        }
+
+        HorizontalBox {
+            GroupBox {
+                title: "ANC";
+                enabled: root.gaia-connected;
+                VerticalBox {
+                    Text { text: "Last read (unverified): " + root.anc-status-text; wrap: word-wrap; }
+                    HorizontalBox {
+                        Button {
+                            text: root.anc-selected == "off" ? "● Off" : "Off";
+                            clicked => {
+                                root.anc-selected = "off";
+                                root.leave-custom-anc();
+                                root.anc-set(false);
+                            }
+                        }
+                        Button {
+                            text: root.anc-selected == "adaptive" ? "● Adaptive" : "Adaptive";
+                            clicked => {
+                                root.anc-selected = "adaptive";
+                                root.leave-custom-anc();
+                                root.anc-set(true);
+                            }
+                        }
+                        Button {
+                            text: root.anc-selected == "custom" ? "● Custom" : "Custom";
+                            clicked => {
+                                if (root.anc-custom-visible) {
+                                    root.anc-selected = "";
+                                    root.leave-custom-anc();
+                                } else {
+                                    root.anc-custom-visible = true;
+                                    root.anc-selected = "custom";
+                                }
+                            }
+                        }
+                    }
+                    Button { text: "Status"; clicked => { root.anc-status(); } }
+                    if root.anc-custom-visible: VerticalBox {
+                        Text { text: "Custom crossfade: 0 = full ANC, 100 = full Transparency"; wrap: word-wrap; }
+                        HorizontalBox {
+                            Slider { minimum: 0; maximum: 100; value <=> root.noise-control-percent; }
+                            Button { text: "Apply"; clicked => { root.noise-control-apply(round(root.noise-control-percent)); } }
+                        }
+                        HorizontalBox {
+                            Text { text: "Anti-wind:"; vertical-alignment: center; }
+                            Switch {
+                                text: root.anti-wind-on ? "On" : "Off";
+                                checked <=> root.anti-wind-on;
+                                toggled => { root.anti-wind-set(root.anti-wind-on); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            GroupBox {
+                title: "Bass Boost";
+                enabled: root.gaia-connected;
+                Switch {
+                    text: root.bass-boost-on ? "On" : "Off";
+                    checked <=> root.bass-boost-on;
+                    toggled => { root.bass-boost-set(root.bass-boost-on); }
+                }
+            }
+        }
+
+        GroupBox {
+            title: "Equalizer";
+            enabled: root.gaia-connected;
+            VerticalBox {
+                HorizontalBox {
+                    preset-combo := ComboBox {
+                        model: root.eq-preset-names;
+                        current-index <=> root.eq-preset-index;
+                    }
+                    Button {
+                        text: "Apply Preset";
+                        clicked => { root.eq-preset-apply(preset-combo.current-value); }
+                    }
+                }
+                // Read-only: bands only change via a preset (or a live
+                // push - see spawn_gaia_notification_listener in
+                // gui/src/main.rs), never by dragging directly.
+                HorizontalBox {
+                    Text { text: "50Hz:"; vertical-alignment: center; width: 60px; }
+                    Slider { enabled: false; minimum: -32; maximum: 40; value <=> root.eq-band-0; }
+                    Text { text: root.eq-band-0-label; vertical-alignment: center; width: 55px; }
+                }
+                HorizontalBox {
+                    Text { text: "250Hz:"; vertical-alignment: center; width: 60px; }
+                    Slider { enabled: false; minimum: -32; maximum: 40; value <=> root.eq-band-1; }
+                    Text { text: root.eq-band-1-label; vertical-alignment: center; width: 55px; }
+                }
+                HorizontalBox {
+                    Text { text: "800Hz:"; vertical-alignment: center; width: 60px; }
+                    Slider { enabled: false; minimum: -32; maximum: 40; value <=> root.eq-band-2; }
+                    Text { text: root.eq-band-2-label; vertical-alignment: center; width: 55px; }
+                }
+                HorizontalBox {
+                    Text { text: "3kHz:"; vertical-alignment: center; width: 60px; }
+                    Slider { enabled: false; minimum: -32; maximum: 40; value <=> root.eq-band-3; }
+                    Text { text: root.eq-band-3-label; vertical-alignment: center; width: 55px; }
+                }
+                HorizontalBox {
+                    Text { text: "8kHz:"; vertical-alignment: center; width: 60px; }
+                    Slider { enabled: false; minimum: -32; maximum: 40; value <=> root.eq-band-4; }
+                    Text { text: root.eq-band-4-label; vertical-alignment: center; width: 55px; }
+                }
+            }
+        }
+
+        HorizontalBox {
+            GroupBox {
+                title: "Crossfeed";
+                enabled: root.gaia-connected;
+                HorizontalBox {
+                    Button {
+                        text: root.crossfeed-selected == "off" ? "● Off" : "Off";
+                        clicked => { root.crossfeed-selected = "off"; root.crossfeed-set("off"); }
+                    }
+                    Button {
+                        text: root.crossfeed-selected == "low" ? "● Low" : "Low";
+                        clicked => { root.crossfeed-selected = "low"; root.crossfeed-set("low"); }
+                    }
+                    Button {
+                        text: root.crossfeed-selected == "high" ? "● High" : "High";
+                        clicked => { root.crossfeed-selected = "high"; root.crossfeed-set("high"); }
+                    }
+                }
+            }
+
+            GroupBox {
+                title: "Multipoint";
+                enabled: root.gaia-connected;
+                VerticalBox {
+                    Text { text: "Current: " + root.multipoint-status-text; wrap: word-wrap; }
+                    Switch {
+                        text: root.multipoint-on ? "On" : "Off";
+                        checked <=> root.multipoint-on;
+                        toggled => { root.multipoint-set(root.multipoint-on); }
+                    }
+                    Button { text: "Status"; clicked => { root.multipoint-status(); } }
+                }
+            }
+        }
+
+        Button {
+            text: root.advanced-visible ? "Hide Advanced" : "Show Advanced";
+            clicked => { root.advanced-visible = !root.advanced-visible; }
+        }
+
+        if root.advanced-visible: GroupBox {
+            title: "Advanced: raw GAIA command";
+            enabled: root.gaia-connected;
+            HorizontalBox {
+                Text { text: "Vendor:"; vertical-alignment: center; }
+                vendor-input := LineEdit { text: "0x0494"; width: 100px; }
+                Text { text: "Command:"; vertical-alignment: center; }
+                command-input := LineEdit { text: ""; width: 100px; }
+                Text { text: "Payload (hex):"; vertical-alignment: center; }
+                payload-input := LineEdit { text: ""; width: 140px; }
+                Text { text: "Version:"; vertical-alignment: center; }
+                version-input := LineEdit { text: "1"; width: 40px; }
+                Button {
+                    text: "Send";
+                    clicked => {
+                        root.raw-gaia-send(vendor-input.text, command-input.text, payload-input.text, version-input.text);
+                    }
+                }
+            }
+        }
+
+        if root.advanced-visible: GroupBox {
+            title: "Log";
+            vertical-stretch: 1;
+            ScrollView {
+                TextEdit {
+                    text: root.log-text;
+                    read-only: true;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}

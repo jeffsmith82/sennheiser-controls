@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["core", "cli", "gui"]
+
+[workspace.dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+clap = { version = "4", features = ["derive"] }
+zbus = "4"
+bluer = { version = "0.17", features = ["bluetoothd", "rfcomm"] }
+futures-util = "0.3"
+btleplug = "0.11"
+uuid = "1"
+sennheiser-core = { path = "core" }

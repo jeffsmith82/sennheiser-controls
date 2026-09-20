@@ -1,0 +1,14 @@
+[package]
+name = "sennheiser-controls"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sennheiser-controls"
+path = "src/main.rs"
+
+[dependencies]
+sennheiser-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+clap.workspace = true

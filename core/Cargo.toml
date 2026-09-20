@@ -1,0 +1,18 @@
+[package]
+name = "sennheiser-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "sennheiser_core"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+clap.workspace = true
+zbus.workspace = true
+bluer.workspace = true
+futures-util.workspace = true
+btleplug.workspace = true
+uuid.workspace = true
