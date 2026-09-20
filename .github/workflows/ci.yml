@@ -53,6 +53,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      # Installed directly (rather than via rustsec/audit-check) so this
+      # always fetches whatever cargo-audit is current: an older bundled
+      # build failed outright on a newer advisory-db entry using CVSS 4.0
+      # syntax, confirmed live against the local 0.20.0 install before this
+      # change - `cargo install --locked cargo-audit` (0.22.2) reads the same
+      # advisory-db fine.
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
