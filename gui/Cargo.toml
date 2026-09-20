@@ -3,6 +3,10 @@ name = "sennheiser-controls-gui"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
+description = "Desktop app to control ANC, EQ, and other settings on Sonova/Sennheiser headphones"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/jeffsmith82/sennheiser-controls"
+authors = ["jeffsmith82 <jeffrey_smith@hotmail.co.uk>"]
 
 [[bin]]
 name = "sennheiser-controls-gui"
@@ -32,3 +36,25 @@ slint = { version = "1", default-features = false, features = [
 
 [build-dependencies]
 slint-build = "1"
+
+# For `cargo deb` (see .github/workflows/release.yml). "$auto" shared-library
+# dependency detection needs dpkg-dev's tools, present on the Ubuntu CI
+# runner this actually gets built on.
+[package.metadata.deb]
+name = "sennheiser-controls-gui"
+depends = "$auto"
+section = "sound"
+assets = [
+    ["target/release/sennheiser-controls-gui", "usr/bin/", "755"],
+    ["../flatpak/io.github.jeffreysmith.SennheiserControls.desktop", "usr/share/applications/", "644"],
+    ["../flatpak/io.github.jeffreysmith.SennheiserControls.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+]
+
+# For `cargo generate-rpm` (see .github/workflows/release.yml).
+[package.metadata.generate-rpm]
+name = "sennheiser-controls-gui"
+assets = [
+    { source = "target/release/sennheiser-controls-gui", dest = "/usr/bin/sennheiser-controls-gui", mode = "755" },
+    { source = "../flatpak/io.github.jeffreysmith.SennheiserControls.desktop", dest = "/usr/share/applications/io.github.jeffreysmith.SennheiserControls.desktop", mode = "644" },
+    { source = "../flatpak/io.github.jeffreysmith.SennheiserControls.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.jeffreysmith.SennheiserControls.svg", mode = "644" },
+]

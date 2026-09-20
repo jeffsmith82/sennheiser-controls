@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, without a "v" prefix (e.g. 1.2.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SYSTEM_DEPS: >-
+    libdbus-1-dev pkg-config
+    libxkbcommon-dev libwayland-dev
+    libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+    libfontconfig1-dev libfreetype6-dev
+    libgl1-mesa-dev libegl1-mesa-dev
+
+jobs:
+  bump-version:
+    name: Bump version, tag, and push
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ env.SYSTEM_DEPS }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Set version in all 3 crates
+        run: |
+          for f in core/Cargo.toml cli/Cargo.toml gui/Cargo.toml; do
+            sed -i "0,/^version = \".*\"/s//version = \"${{ inputs.version }}\"/" "$f"
+          done
+      - name: Refresh Cargo.lock to match
+        run: cargo check --workspace
+      - id: tag
+        run: echo "tag=v${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+      - name: Commit and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add core/Cargo.toml cli/Cargo.toml gui/Cargo.toml Cargo.lock
+          git commit -m "Release ${{ steps.tag.outputs.tag }}"
+          git tag "${{ steps.tag.outputs.tag }}"
+          git push origin HEAD:main
+          git push origin "${{ steps.tag.outputs.tag }}"
+
+  build-deb:
+    name: Build .deb
+    needs: bump-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump-version.outputs.tag }}
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ env.SYSTEM_DEPS }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-deb
+      - run: cargo build --release -p sennheiser-controls-gui
+      - run: cargo deb -p sennheiser-controls-gui --no-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-package
+          path: target/debian/*.deb
+
+  build-rpm:
+    name: Build .rpm
+    needs: bump-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump-version.outputs.tag }}
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ env.SYSTEM_DEPS }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-generate-rpm
+      - run: cargo build --release -p sennheiser-controls-gui
+      - run: cargo generate-rpm -p gui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-package
+          path: target/generate-rpm/*.rpm
+
+  build-flatpak:
+    name: Build .flatpak
+    needs: bump-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump-version.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Vendor dependencies for the offline sandboxed build
+        run: cargo vendor vendor
+      - name: Install flatpak and flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder
+          sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+      - name: Install the Freedesktop runtime/SDK and Rust extension
+        run: |
+          sudo flatpak install -y --noninteractive flathub \
+            org.freedesktop.Platform//25.08 \
+            org.freedesktop.Sdk//25.08 \
+            org.freedesktop.Sdk.Extension.rust-stable//25.08
+      - name: Build
+        run: flatpak-builder --force-clean --repo=flatpak-repo build-dir flatpak/io.github.jeffreysmith.SennheiserControls.yml
+      - name: Bundle into a single distributable .flatpak file
+        run: |
+          flatpak build-bundle flatpak-repo \
+            "sennheiser-controls-gui-${{ inputs.version }}.flatpak" \
+            io.github.jeffreysmith.SennheiserControls
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-package
+          path: '*.flatpak'
+
+  release:
+    name: Create GitHub Release
+    needs: [bump-version, build-deb, build-rpm, build-flatpak]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.bump-version.outputs.tag }}
+          name: ${{ needs.bump-version.outputs.tag }}
+          files: artifacts/*
