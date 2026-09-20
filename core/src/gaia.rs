@@ -522,3 +522,186 @@ pub fn parse_hex_bytes(s: &str) -> Result<Vec<u8>> {
         .map(|i| u8::from_str_radix(&cleaned[i..i + 2], 16).map_err(Into::into))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_packet_concatenates_vendor_command_payload_big_endian() {
+        assert_eq!(build_packet(0x0495, 0x1a00, &[0x03, 0x01]), vec![0x04, 0x95, 0x1a, 0x00, 0x03, 0x01]);
+        assert_eq!(build_packet(0x001d, 0x0007, &[]), vec![0x00, 0x1d, 0x00, 0x07]);
+    }
+
+    #[test]
+    fn build_frame_prepends_sof_version_flags_length() {
+        let frame = build_frame(3, 0x0495, 0x1a00, &[0x03, 0x01]).unwrap();
+        // SOF, version, flags (no checksum/length-ext), length = packet.len() - 4.
+        assert_eq!(frame, vec![0xff, 0x03, 0x00, 0x02, 0x04, 0x95, 0x1a, 0x00, 0x03, 0x01]);
+    }
+
+    #[test]
+    fn build_frame_rejects_oversized_payload() {
+        // packet.len() = 4 + payload.len(); the simplified (non-extended-length)
+        // framer can't represent a packet over 254 bytes.
+        let oversized_payload = vec![0u8; 251];
+        assert!(build_frame(3, 0x0495, 0x1a00, &oversized_payload).is_err());
+
+        let max_payload = vec![0u8; 250];
+        assert!(build_frame(3, 0x0495, 0x1a00, &max_payload).is_ok());
+    }
+
+    #[test]
+    fn parse_packet_rejects_too_short_input() {
+        assert!(parse_packet(&[0x04, 0x95, 0x1a]).is_err());
+    }
+
+    #[test]
+    fn parse_packet_with_no_extra_bytes_has_no_status_or_payload() {
+        let resp = parse_packet(&[0x04, 0x95, 0x1a, 0x00]).unwrap();
+        assert_eq!(resp.vendor_id, 0x0495);
+        assert_eq!(resp.command_id, 0x1a00);
+        assert_eq!(resp.status, None);
+        assert_eq!(resp.payload, Vec::<u8>::new());
+    }
+
+    /// This is the subtlety that caused real bugs this project shipped and
+    /// fixed live (EQ band 0 and the ANC/Crossfeed/BassBoost/Multipoint
+    /// single-byte events were all first misread as `payload[0]` before
+    /// being corrected to `status`) - pinned down here so it can't regress.
+    #[test]
+    fn parse_packet_puts_first_extra_byte_in_status_not_payload() {
+        let resp = parse_packet(&[0x04, 0x95, 0x2f, 0x01, 0x01]).unwrap();
+        assert_eq!(resp.status, Some(0x01));
+        assert_eq!(resp.payload, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn parse_packet_splits_status_from_remaining_payload() {
+        // Real capture: the RSP_SONOVA_ANC_SET push during the connect-time
+        // handshake, decoding to AncMode(true) - see gaia::RSP_SONOVA_ANC_SET
+        // and commands::interpret_event's tests.
+        let resp = parse_packet(&[0x04, 0x95, 0x1a, 0x81, 0x01, 0x00, 0x02, 0x00, 0x03, 0x01]).unwrap();
+        assert_eq!(resp.vendor_id, SONOVA_VENDOR_ID);
+        assert_eq!(resp.command_id, RSP_SONOVA_ANC_SET);
+        assert_eq!(resp.status, Some(0x01));
+        assert_eq!(resp.payload, vec![0x00, 0x02, 0x00, 0x03, 0x01]);
+    }
+
+    #[test]
+    fn parse_frame_rejects_missing_sof() {
+        assert!(parse_frame(&[0x00, 0x03, 0x00, 0x02, 0x04, 0x95, 0x1a, 0x00]).is_err());
+    }
+
+    #[test]
+    fn parse_frame_rejects_truncated_input() {
+        // Header claims a 2-byte payload (length=6) but only 1 byte follows.
+        assert!(parse_frame(&[0xff, 0x03, 0x00, 0x06, 0x04, 0x95, 0x1a, 0x00, 0x03]).is_err());
+    }
+
+    #[test]
+    fn build_frame_then_parse_frame_round_trips_vendor_and_command() {
+        // Not a full round trip for `payload`: build_frame's payload becomes
+        // parse_packet's status+payload split, since build_packet has no
+        // concept of a separate status byte - documented here so it isn't
+        // mistaken for a bug later.
+        let frame = build_frame(3, 0x0495, 0x1a02, &[0x64]).unwrap();
+        let resp = parse_frame(&frame).unwrap();
+        assert_eq!(resp.vendor_id, 0x0495);
+        assert_eq!(resp.command_id, 0x1a02);
+        assert_eq!(resp.status, Some(0x64));
+        assert_eq!(resp.payload, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn parse_frame_honors_extended_length_flag() {
+        // Hand-built: build_frame never sets this flag (it only implements
+        // the simplified single-byte-length framing), so this is the only
+        // way to exercise the extended-length path at all.
+        let payload = vec![0xaa; 300];
+        let mut packet = vec![0x04, 0x95, 0x1a, 0x00];
+        packet.extend_from_slice(&payload);
+        let mut frame = vec![0xff, 0x03, FLAG_LENGTH_EXT];
+        frame.extend_from_slice(&((packet.len() - 4) as u16).to_be_bytes());
+        frame.extend_from_slice(&packet);
+
+        let resp = parse_frame(&frame).unwrap();
+        assert_eq!(resp.vendor_id, 0x0495);
+        assert_eq!(resp.command_id, 0x1a00);
+        assert_eq!(resp.payload.len(), payload.len() - 1); // first byte -> status
+    }
+
+    #[test]
+    fn deframe_one_needs_more_data_on_empty_or_short_buffer() {
+        assert!(deframe_one(&[]).unwrap().is_none());
+        assert!(deframe_one(&[0xff, 0x03]).unwrap().is_none());
+        // Header complete but declared payload not fully arrived yet.
+        assert!(deframe_one(&[0xff, 0x03, 0x00, 0x06, 0x04, 0x95]).unwrap().is_none());
+    }
+
+    #[test]
+    fn deframe_one_rejects_bad_sof() {
+        assert!(deframe_one(&[0x00, 0x03, 0x00, 0x00, 0x04, 0x95, 0x1a, 0x00]).is_err());
+    }
+
+    #[test]
+    fn deframe_one_extracts_exactly_one_frame_and_reports_bytes_consumed() {
+        let frame = build_frame(3, 0x0495, 0x1a02, &[0x64]).unwrap();
+        let (consumed, resp) = deframe_one(&frame).unwrap().unwrap();
+        assert_eq!(consumed, frame.len());
+        assert_eq!(resp.command_id, 0x1a02);
+    }
+
+    #[test]
+    fn deframe_one_leaves_trailing_bytes_for_the_next_frame() {
+        // The exact scenario the reader task in transport.rs relies on:
+        // multiple frames can arrive in a single socket read.
+        let first = build_frame(3, 0x0495, 0x1a83, &[0x00]).unwrap();
+        let second = build_frame(3, 0x0495, 0x1885, &[0x01]).unwrap();
+        let mut buf = first.clone();
+        buf.extend_from_slice(&second);
+
+        let (consumed, resp) = deframe_one(&buf).unwrap().unwrap();
+        assert_eq!(consumed, first.len());
+        assert_eq!(resp.command_id, 0x1a83);
+
+        let (consumed2, resp2) = deframe_one(&buf[consumed..]).unwrap().unwrap();
+        assert_eq!(consumed2, second.len());
+        assert_eq!(resp2.command_id, 0x1885);
+    }
+
+    #[test]
+    fn parse_hex_u16_accepts_0x_prefix_and_case_insensitivity() {
+        assert_eq!(parse_hex_u16("0x1a00").unwrap(), 0x1a00);
+        assert_eq!(parse_hex_u16("1A00").unwrap(), 0x1a00);
+        assert_eq!(parse_hex_u16("  0X07  ").unwrap(), 0x07);
+    }
+
+    #[test]
+    fn parse_hex_u16_rejects_invalid_input() {
+        assert!(parse_hex_u16("not-hex").is_err());
+    }
+
+    #[test]
+    fn parse_hex_bytes_strips_whitespace() {
+        assert_eq!(parse_hex_bytes("0001").unwrap(), vec![0x00, 0x01]);
+        assert_eq!(parse_hex_bytes("00 01").unwrap(), vec![0x00, 0x01]);
+        assert_eq!(parse_hex_bytes("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn parse_hex_bytes_rejects_odd_length_and_invalid_digits() {
+        assert!(parse_hex_bytes("000").is_err());
+        assert!(parse_hex_bytes("zz").is_err());
+    }
+
+    #[test]
+    fn eq_presets_have_unique_names_and_five_bands_each() {
+        let mut names: Vec<&str> = EQ_PRESETS.iter().map(|(n, _)| *n).collect();
+        let before_dedup = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), before_dedup, "duplicate preset name in EQ_PRESETS");
+        assert!(EQ_PRESETS.iter().any(|(n, g)| *n == "rock" && *g == [0, 20, 25, 15, -20]));
+    }
+}

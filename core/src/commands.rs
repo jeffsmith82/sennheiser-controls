@@ -268,3 +268,177 @@ pub async fn send_raw(
 ) -> Result<GaiaResponse> {
     gaia.send(version, vendor_id, command_id, payload).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a [`GaiaResponse`] without going through the wire-format
+    /// parser, for tests that only care about `interpret_event`'s own
+    /// decode logic.
+    fn resp(vendor_id: u16, command_id: u16, status: Option<u8>, payload: &[u8]) -> GaiaResponse {
+        GaiaResponse { vendor_id, command_id, status, payload: payload.to_vec() }
+    }
+
+    #[test]
+    fn interpret_event_decodes_anc_mode_from_real_capture() {
+        // Real capture: the RSP_SONOVA_ANC_SET push during the connect-time
+        // handshake burst - status=0x01, payload=[00,02,00,03,01] (param
+        // 0x03 = ANC mode, state 0x01 = Adaptive) - see
+        // gaia::RSP_SONOVA_ANC_SET docs.
+        let r = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_ANC_SET, Some(0x01), &[0x00, 0x02, 0x00, 0x03, 0x01]);
+        assert!(matches!(interpret_event(&r), Some(DeviceEvent::AncMode(true))));
+    }
+
+    #[test]
+    fn interpret_event_decodes_anti_wind_from_anc_set_response() {
+        // Same response ID as ANC mode, distinguished only by the param
+        // byte (0x01 = Anti-wind here instead of 0x03 = ANC mode) - see
+        // CMD_SONOVA_ANC_SET's docs.
+        let r = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_ANC_SET, Some(0x00), &[0x00, 0x00, 0x00, 0x01, 0x00]);
+        assert!(matches!(interpret_event(&r), Some(DeviceEvent::AntiWind(false))));
+    }
+
+    #[test]
+    fn interpret_event_ignores_anc_set_response_with_unknown_param() {
+        let r = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_ANC_SET, Some(0x00), &[0x00, 0x00, 0x00, 0x99, 0x01]);
+        assert!(interpret_event(&r).is_none());
+    }
+
+    #[test]
+    fn interpret_event_does_not_panic_on_too_short_anc_set_payload() {
+        // Regression guard for the `payload.len().checked_sub(2)` guard -
+        // an empty or 1-byte payload must decode to None, not panic.
+        assert!(interpret_event(&resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_ANC_SET, Some(0), &[])).is_none());
+        assert!(interpret_event(&resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_ANC_SET, Some(0), &[0x01])).is_none());
+    }
+
+    #[test]
+    fn interpret_event_decodes_anc_set_companion_from_status_byte() {
+        // Real capture: pushed alongside RSP_SONOVA_ANC_SET at connect time,
+        // payload=[] - the value is genuinely in `status`, not `payload`
+        // (see parse_packet's docs) - this exact mixup was a real bug fixed
+        // live this session.
+        let r = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_ANC_SET_COMPANION, Some(0x01), &[]);
+        assert!(matches!(interpret_event(&r), Some(DeviceEvent::AncMode(true))));
+    }
+
+    #[test]
+    fn interpret_event_decodes_custom_noise_control_from_real_captures() {
+        // Real captures from the double-tap ANC/Transparency gesture:
+        // status=100 (full Transparency) and status=0 (back to Adaptive).
+        let transparency = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_CUSTOM_NOISE_CONTROL_SET, Some(100), &[]);
+        assert!(matches!(interpret_event(&transparency), Some(DeviceEvent::CustomNoiseControl(100))));
+
+        let adaptive = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_CUSTOM_NOISE_CONTROL_SET, Some(0), &[]);
+        assert!(matches!(interpret_event(&adaptive), Some(DeviceEvent::CustomNoiseControl(0))));
+    }
+
+    #[test]
+    fn interpret_event_decodes_custom_mode_active_from_real_captures() {
+        let active = resp(gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_CUSTOM_MODE_ACTIVE_NOTIFY, Some(1), &[]);
+        assert!(matches!(interpret_event(&active), Some(DeviceEvent::CustomModeActive(true))));
+
+        let inactive = resp(gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_CUSTOM_MODE_ACTIVE_NOTIFY, Some(0), &[]);
+        assert!(matches!(interpret_event(&inactive), Some(DeviceEvent::CustomModeActive(false))));
+    }
+
+    #[test]
+    fn interpret_event_decodes_bass_boost_from_real_capture() {
+        let r = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_BASS_BOOST_SET, Some(0), &[]);
+        assert!(matches!(interpret_event(&r), Some(DeviceEvent::BassBoost(false))));
+    }
+
+    #[test]
+    fn interpret_event_decodes_crossfeed_using_non_sequential_encoding() {
+        let off = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_CROSSFEED_GET, Some(gaia::CROSSFEED_OFF), &[]);
+        assert!(matches!(interpret_event(&off), Some(DeviceEvent::Crossfeed(CrossfeedLevel::Off))));
+
+        let low = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_CROSSFEED_GET, Some(gaia::CROSSFEED_LOW), &[]);
+        assert!(matches!(interpret_event(&low), Some(DeviceEvent::Crossfeed(CrossfeedLevel::Low))));
+
+        let high = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_CROSSFEED_GET, Some(gaia::CROSSFEED_HIGH), &[]);
+        assert!(matches!(interpret_event(&high), Some(DeviceEvent::Crossfeed(CrossfeedLevel::High))));
+    }
+
+    #[test]
+    fn interpret_event_ignores_unrecognized_crossfeed_value() {
+        let r = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_CROSSFEED_GET, Some(0x05), &[]);
+        assert!(interpret_event(&r).is_none());
+    }
+
+    #[test]
+    fn interpret_event_decodes_eq_bands_from_real_rock_capture() {
+        // Real capture: device set to "rock" ([0, 20, 25, 15, -20]) -
+        // status=0 (band 0), payload=[0x14, 0x19, 0x0f, 0xec] (bands 1-4) -
+        // see gaia::RSP_SONOVA_EQ_SET_BAND docs.
+        let r = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_EQ_SET_BAND, Some(0), &[0x14, 0x19, 0x0f, 0xec]);
+        assert!(matches!(interpret_event(&r), Some(DeviceEvent::EqBands([0, 20, 25, 15, -20]))));
+    }
+
+    #[test]
+    fn interpret_event_decodes_eq_bands_from_real_dance_capture() {
+        // Real capture: the final ack while applying "dance"
+        // ([35, 20, -15, 15, 30]) - status=35 (band 0, chosen specifically
+        // because it's non-zero, which is what proved band 0 lives in
+        // `status` and isn't just omitted - see gaia::RSP_SONOVA_EQ_SET_BAND
+        // docs for the full story).
+        let r = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_EQ_SET_BAND, Some(35), &[0x14, 0xf1, 0x0f, 0x1e]);
+        let event = interpret_event(&r);
+        assert!(matches!(event, Some(DeviceEvent::EqBands([35, 20, -15, 15, 30]))));
+
+        let DeviceEvent::EqBands(gains) = event.unwrap() else { unreachable!() };
+        assert_eq!(find_eq_preset(gains), Some((4, "dance")));
+    }
+
+    #[test]
+    fn interpret_event_ignores_eq_set_band_response_with_other_payload_shapes() {
+        // The same command ID also carries other, undeciphered payload
+        // shapes under the same registration category - only the exact
+        // 4-byte shape should decode.
+        let wrong_len = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_EQ_SET_BAND, Some(0), &[0x14, 0x19, 0x0f]);
+        assert!(interpret_event(&wrong_len).is_none());
+    }
+
+    #[test]
+    fn interpret_event_decodes_multipoint_enabled_from_real_capture() {
+        let r = resp(gaia::QUALCOMM_VENDOR_ID, gaia::RSP_QUALCOMM_MULTIPOINT_SET, Some(1), &[]);
+        assert!(matches!(interpret_event(&r), Some(DeviceEvent::MultipointEnabled(true))));
+    }
+
+    #[test]
+    fn interpret_event_decodes_multipoint_status_from_real_capture() {
+        let on = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_MULTIPOINT_STATUS_GET, Some(2), &[]);
+        assert!(matches!(interpret_event(&on), Some(DeviceEvent::MultipointStatus(MultipointStatus::On))));
+
+        let unexpected = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_MULTIPOINT_STATUS_GET, Some(9), &[]);
+        assert!(matches!(interpret_event(&unexpected), Some(DeviceEvent::MultipointStatus(MultipointStatus::Unknown(9)))));
+    }
+
+    #[test]
+    fn interpret_event_requires_the_right_vendor_id_not_just_command_id() {
+        // RSP_QUALCOMM_MULTIPOINT_SET (0x0e80) under the WRONG vendor should
+        // not decode as anything - vendor_id namespaces command_id, so a
+        // matching command_id under a different vendor is a different,
+        // unrelated command.
+        let r = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_QUALCOMM_MULTIPOINT_SET, Some(1), &[]);
+        assert!(interpret_event(&r).is_none());
+    }
+
+    #[test]
+    fn interpret_event_ignores_unknown_command() {
+        let r = resp(gaia::SONOVA_VENDOR_ID, 0xffff, Some(0), &[]);
+        assert!(interpret_event(&r).is_none());
+    }
+
+    #[test]
+    fn find_eq_preset_matches_known_presets_exactly() {
+        assert_eq!(find_eq_preset([0, 20, 25, 15, -20]), Some((2, "rock")));
+        assert_eq!(find_eq_preset([0, 0, 0, 0, 0]), Some((0, "neutral")));
+    }
+
+    #[test]
+    fn find_eq_preset_returns_none_for_a_manually_tweaked_eq() {
+        assert_eq!(find_eq_preset([1, 2, 3, 4, 5]), None);
+    }
+}
