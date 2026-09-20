@@ -514,7 +514,7 @@ pub fn parse_hex_u16(s: &str) -> Result<u16> {
 /// Parses a hex byte string like "0001" or "00 01" into raw bytes.
 pub fn parse_hex_bytes(s: &str) -> Result<Vec<u8>> {
     let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if cleaned.len() % 2 != 0 {
+    if !cleaned.len().is_multiple_of(2) {
         bail!("hex payload must have an even number of digits");
     }
     (0..cleaned.len())

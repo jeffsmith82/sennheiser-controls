@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-const BATTERY_LEVEL_CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x0000_2a19_0000_1000_8000_00805f9b34fb);
+const BATTERY_LEVEL_CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x0000_2a19_0000_1000_8000_0080_5f9b_34fb);
 
 /// Finds a matching, already-known-to-the-OS BLE peripheral (no active scan
 /// needed - paired/previously-seen devices are already in BlueZ's list) and
