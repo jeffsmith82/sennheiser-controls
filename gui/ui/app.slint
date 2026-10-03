@@ -1,9 +1,91 @@
-import { Button, ComboBox, Slider, Switch, GroupBox, LineEdit, TextEdit, ScrollView, VerticalBox, HorizontalBox } from "std-widgets.slint";
+import { Button, ComboBox, Slider, Switch, LineEdit, TextEdit, ScrollView, Palette } from "std-widgets.slint";
+
+// A plain rounded container with an optional title - std-widgets' GroupBox
+// in this style has no background/border/radius at all (just a title Text
+// floating over an invisible Rectangle), which is most of why the app
+// looked bare. This is the main visual upgrade: every panel below is one of
+// these instead.
+component Card inherits Rectangle {
+    in property <string> title: "";
+    // Custom components don't automatically inherit a settable `enabled`
+    // from their root element the way built-in/std-widget ones do, so it
+    // has to be declared explicitly here. Used to dim the whole card rather
+    // than actually blocking input - the underlying GroupBox this replaces
+    // never blocked input either (its own `enabled` only ever tinted the
+    // title text), and every Rust action already handles "not connected"
+    // gracefully on its own.
+    in property <bool> enabled: true;
+    background: Palette.alternate-background;
+    border-radius: 12px;
+    opacity: root.enabled ? 1.0 : 0.55;
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 12px;
+
+        if root.title != "": Text {
+            text: root.title;
+            font-size: 15px;
+            font-weight: 700;
+            color: Palette.foreground;
+        }
+
+        @children
+    }
+}
+
+// A segmented-control-style option button (ANC mode, Crossfeed level) -
+// filled with the accent color when selected, otherwise a plain control
+// background. Meant to be used 2-4 at a time in a HorizontalLayout with
+// `horizontal-stretch: 1` on each.
+component PillButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected: false;
+    callback clicked();
+
+    height: 36px;
+    border-radius: 8px;
+    background: root.selected ? Palette.accent-background : Palette.control-background;
+    animate background { duration: 120ms; }
+
+    Text {
+        text: root.text;
+        color: root.selected ? Palette.accent-foreground : Palette.control-foreground;
+        font-weight: root.selected ? 700 : 400;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// Small muted label, for secondary/status text under a card's main controls.
+component Caption inherits Text {
+    color: Palette.foreground.with-alpha(0.6);
+    font-size: 12px;
+    wrap: word-wrap;
+}
+
+// One entry in `paired-devices` below - mirrors `commands::PairedDevice` in
+// gui/src/main.rs.
+export struct PairedDeviceInfo {
+    name: string,
+    connected: bool,
+}
 
 export component AppWindow inherits Window {
     title: "Sennheiser Controls";
-    preferred-width: 900px;
-    preferred-height: 700px;
+    preferred-width: 980px;
+    preferred-height: 760px;
+    background: Palette.background;
+
+    // Force dark mode regardless of the system theme - this app's whole
+    // visual design (Card/PillButton colors above) is built around it, and
+    // every std-widget here (Switch, Slider, ComboBox, etc) reads the same
+    // Palette internally, so this alone reskins them consistently too.
+    init => { Palette.color-scheme = ColorScheme.dark; }
 
     // --- Device state, set from Rust ---
     in property <[string]> device-names: [];
@@ -65,6 +147,41 @@ export component AppWindow inherits Window {
     // `spawn_gaia_notification_listener` in gui/src/main.rs.
     in property <string> anc-status-text: "unknown";
     in property <string> multipoint-status-text: "unknown";
+    // The headset's own paired-device list, by name - distinct from
+    // multipoint-status-text above, which only reports a currently-connected
+    // COUNT. UNVERIFIED opcode (0x1400/0x1401) - see
+    // gaia::CMD_SONOVA_PAIRED_DEVICE_GET docs, particularly around what
+    // `connected` really means.
+    in property <[PairedDeviceInfo]> paired-devices: [];
+
+    // --- Device info + "more settings", from the third-party protocol
+    // writeup (see core/src/gaia.rs doc comments) - UNVERIFIED opcodes,
+    // though all of these round-tripped correctly in live testing except
+    // Audio Mode and Prompt Language SET, which are deliberately left out
+    // of this UI entirely (CLI-only, see `commands::set_audio_mode`/
+    // `set_prompt_language` docs).
+    in property <string> device-info-text: "Not queried yet.";
+    callback refresh-device-info();
+
+    in-out property <bool> smart-pause-on: false;
+    in-out property <bool> on-head-detection-on: false;
+    in-out property <bool> auto-answer-on: false;
+    in-out property <bool> comfort-call-on: false;
+    in-out property <bool> low-latency-on: false;
+    in-out property <bool> bt-compatibility-on: false;
+    in-out property <bool> voice-prompt-on: false;
+    in-out property <float> sidetone-level: 0;
+    in-out property <float> auto-power-off-seconds: 900;
+    callback smart-pause-set(bool);
+    callback on-head-detection-set(bool);
+    callback auto-answer-set(bool);
+    callback comfort-call-set(bool);
+    callback low-latency-set(bool);
+    callback bt-compatibility-set(bool);
+    callback voice-prompt-set(bool);
+    callback sidetone-set(int);
+    callback auto-power-off-set(int);
+    callback refresh-more-settings();
 
     // ANC/Transparency crossfade slider, revealed by the ANC panel's
     // "Custom" button. Two-way bound like volume-value/eq-band-* above so
@@ -127,6 +244,7 @@ export component AppWindow inherits Window {
     callback anti-wind-set(bool);
     callback multipoint-set(bool);
     callback multipoint-status();
+    callback refresh-paired-devices();
     callback noise-control-apply(int);
     callback raw-gaia-send(string, string, string, string);
 
@@ -136,34 +254,38 @@ export component AppWindow inherits Window {
     // and log panels out of the way for normal use.
     property <bool> advanced-visible: false;
 
-    VerticalBox {
-        padding: 10px;
-        spacing: 8px;
+    ScrollView {
+        VerticalLayout {
+            padding: 20px;
+            spacing: 14px;
+            alignment: start;
 
-        GroupBox {
-            title: "Device";
-            VerticalBox {
-                HorizontalBox {
+            Card {
+                HorizontalLayout {
+                    spacing: 10px;
                     ComboBox {
                         model: root.device-names;
                         current-index <=> root.selected-device-index;
                         selected(value) => { root.device-selected(root.selected-device-index); }
                     }
                     Button { text: "Refresh"; clicked => { root.refresh-devices(); } }
-                }
-                HorizontalBox {
-                    Text { text: "Transport:"; vertical-alignment: center; }
-                    Button {
+                    Rectangle { horizontal-stretch: 1; }
+                    Text { text: "Transport:"; vertical-alignment: center; color: Palette.foreground; }
+                    PillButton {
                         text: "Classic";
+                        selected: root.transport-kind == "classic";
+                        width: 80px;
                         clicked => { root.set-transport("classic"); }
                     }
-                    Button {
+                    PillButton {
                         text: "BLE";
+                        selected: root.transport-kind == "ble";
+                        width: 60px;
                         clicked => { root.set-transport("ble"); }
                     }
-                    Text { text: "(" + root.transport-kind + ")"; vertical-alignment: center; }
                 }
-                HorizontalBox {
+                HorizontalLayout {
+                    spacing: 10px;
                     Button {
                         text: root.gaia-connected ? "Disconnect" : "Connect";
                         clicked => {
@@ -174,67 +296,82 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    Text { text: root.connection-status; vertical-alignment: center; }
+                    Rectangle {
+                        width: 10px;
+                        height: 10px;
+                        border-radius: 5px;
+                        y: (parent.height - self.height) / 2;
+                        background: root.gaia-connected ? #4ade80 : #6b7280;
+                    }
+                    Text { text: root.connection-status; vertical-alignment: center; color: Palette.foreground; }
                 }
             }
-        }
 
-        HorizontalBox {
-            GroupBox {
-                title: "Volume";
-                VerticalBox {
-                    Text { text: root.volume-text; }
+            HorizontalLayout {
+                spacing: 14px;
+                Card {
+                    title: "Volume";
+                    horizontal-stretch: 1;
+                    Text { text: root.volume-text; color: Palette.foreground; }
                     Slider {
                         minimum: 0;
                         maximum: 127;
                         value <=> root.volume-value;
                         changed(value) => { root.set-volume(round(value)); }
                     }
-                    HorizontalBox {
+                    HorizontalLayout {
+                        spacing: 8px;
                         Button { text: "-8"; clicked => { root.volume-step(-8); } }
                         Button { text: "+8"; clicked => { root.volume-step(8); } }
                         Button { text: "Refresh"; clicked => { root.refresh-volume(); } }
                     }
                 }
-            }
 
-            GroupBox {
-                title: "Battery";
-                VerticalBox {
-                    Text { text: root.battery-text; }
-                    HorizontalBox {
+                Card {
+                    title: "Battery";
+                    horizontal-stretch: 1;
+                    Text { text: root.battery-text; color: Palette.foreground; }
+                    HorizontalLayout {
+                        spacing: 8px;
                         Button { text: "Refresh (bluez)"; clicked => { root.refresh-battery-bluez(); } }
                         Button { text: "Refresh (btleplug)"; clicked => { root.refresh-battery-btleplug(); } }
                     }
                 }
             }
-        }
 
-        HorizontalBox {
-            GroupBox {
-                title: "ANC";
-                enabled: root.gaia-connected;
-                VerticalBox {
-                    Text { text: "Last read (unverified): " + root.anc-status-text; wrap: word-wrap; }
-                    HorizontalBox {
-                        Button {
-                            text: root.anc-selected == "off" ? "● Off" : "Off";
+            HorizontalLayout {
+                spacing: 14px;
+                Card {
+                    title: "ANC";
+                    enabled: root.gaia-connected;
+                    horizontal-stretch: 2;
+                    Caption { text: "Last read (unverified): " + root.anc-status-text; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        PillButton {
+                            text: "Off";
+                            selected: root.anc-selected == "off";
+                            horizontal-stretch: 1;
                             clicked => {
                                 root.anc-selected = "off";
                                 root.leave-custom-anc();
                                 root.anc-set(false);
                             }
                         }
-                        Button {
-                            text: root.anc-selected == "adaptive" ? "● Adaptive" : "Adaptive";
+                        PillButton {
+                            text: "Adaptive";
+                            selected: root.anc-selected == "adaptive";
+                            horizontal-stretch: 1;
                             clicked => {
                                 root.anc-selected = "adaptive";
                                 root.leave-custom-anc();
                                 root.anc-set(true);
                             }
                         }
-                        Button {
-                            text: root.anc-selected == "custom" ? "● Custom" : "Custom";
+                        PillButton {
+                            text: "Custom";
+                            selected: root.anc-selected == "custom";
+                            horizontal-stretch: 1;
                             clicked => {
                                 if (root.anc-custom-visible) {
                                     root.anc-selected = "";
@@ -242,19 +379,31 @@ export component AppWindow inherits Window {
                                 } else {
                                     root.anc-custom-visible = true;
                                     root.anc-selected = "custom";
+                                    // Matches the official app: entering
+                                    // Custom lands the crossfade at 50
+                                    // (neutral) and turns Anti-wind on,
+                                    // applied immediately rather than left
+                                    // as a dangling local UI change.
+                                    root.noise-control-percent = 50;
+                                    root.noise-control-apply(50);
+                                    root.anti-wind-on = true;
+                                    root.anti-wind-set(true);
                                 }
                             }
                         }
                     }
                     Button { text: "Status"; clicked => { root.anc-status(); } }
-                    if root.anc-custom-visible: VerticalBox {
-                        Text { text: "Custom crossfade: 0 = full ANC, 100 = full Transparency"; wrap: word-wrap; }
-                        HorizontalBox {
+                    if root.anc-custom-visible: VerticalLayout {
+                        spacing: 10px;
+                        Caption { text: "Custom crossfade: 0 = full ANC, 100 = full Transparency"; }
+                        HorizontalLayout {
+                            spacing: 8px;
                             Slider { minimum: 0; maximum: 100; value <=> root.noise-control-percent; }
                             Button { text: "Apply"; clicked => { root.noise-control-apply(round(root.noise-control-percent)); } }
                         }
-                        HorizontalBox {
-                            Text { text: "Anti-wind:"; vertical-alignment: center; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text { text: "Anti-wind:"; vertical-alignment: center; color: Palette.foreground; }
                             Switch {
                                 text: root.anti-wind-on ? "On" : "Off";
                                 checked <=> root.anti-wind-on;
@@ -263,24 +412,24 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-            }
 
-            GroupBox {
-                title: "Bass Boost";
-                enabled: root.gaia-connected;
-                Switch {
-                    text: root.bass-boost-on ? "On" : "Off";
-                    checked <=> root.bass-boost-on;
-                    toggled => { root.bass-boost-set(root.bass-boost-on); }
+                Card {
+                    title: "Bass Boost";
+                    enabled: root.gaia-connected;
+                    horizontal-stretch: 1;
+                    Switch {
+                        text: root.bass-boost-on ? "On" : "Off";
+                        checked <=> root.bass-boost-on;
+                        toggled => { root.bass-boost-set(root.bass-boost-on); }
+                    }
                 }
             }
-        }
 
-        GroupBox {
-            title: "Equalizer";
-            enabled: root.gaia-connected;
-            VerticalBox {
-                HorizontalBox {
+            Card {
+                title: "Equalizer";
+                enabled: root.gaia-connected;
+                HorizontalLayout {
+                    spacing: 10px;
                     preset-combo := ComboBox {
                         model: root.eq-preset-names;
                         current-index <=> root.eq-preset-index;
@@ -293,103 +442,224 @@ export component AppWindow inherits Window {
                 // Read-only: bands only change via a preset (or a live
                 // push - see spawn_gaia_notification_listener in
                 // gui/src/main.rs), never by dragging directly.
-                HorizontalBox {
-                    Text { text: "50Hz:"; vertical-alignment: center; width: 60px; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "50Hz:"; vertical-alignment: center; width: 60px; color: Palette.foreground; }
                     Slider { enabled: false; minimum: -32; maximum: 40; value <=> root.eq-band-0; }
-                    Text { text: root.eq-band-0-label; vertical-alignment: center; width: 55px; }
+                    Text { text: root.eq-band-0-label; vertical-alignment: center; width: 55px; color: Palette.foreground; }
                 }
-                HorizontalBox {
-                    Text { text: "250Hz:"; vertical-alignment: center; width: 60px; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "250Hz:"; vertical-alignment: center; width: 60px; color: Palette.foreground; }
                     Slider { enabled: false; minimum: -32; maximum: 40; value <=> root.eq-band-1; }
-                    Text { text: root.eq-band-1-label; vertical-alignment: center; width: 55px; }
+                    Text { text: root.eq-band-1-label; vertical-alignment: center; width: 55px; color: Palette.foreground; }
                 }
-                HorizontalBox {
-                    Text { text: "800Hz:"; vertical-alignment: center; width: 60px; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "800Hz:"; vertical-alignment: center; width: 60px; color: Palette.foreground; }
                     Slider { enabled: false; minimum: -32; maximum: 40; value <=> root.eq-band-2; }
-                    Text { text: root.eq-band-2-label; vertical-alignment: center; width: 55px; }
+                    Text { text: root.eq-band-2-label; vertical-alignment: center; width: 55px; color: Palette.foreground; }
                 }
-                HorizontalBox {
-                    Text { text: "3kHz:"; vertical-alignment: center; width: 60px; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "3kHz:"; vertical-alignment: center; width: 60px; color: Palette.foreground; }
                     Slider { enabled: false; minimum: -32; maximum: 40; value <=> root.eq-band-3; }
-                    Text { text: root.eq-band-3-label; vertical-alignment: center; width: 55px; }
+                    Text { text: root.eq-band-3-label; vertical-alignment: center; width: 55px; color: Palette.foreground; }
                 }
-                HorizontalBox {
-                    Text { text: "8kHz:"; vertical-alignment: center; width: 60px; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "8kHz:"; vertical-alignment: center; width: 60px; color: Palette.foreground; }
                     Slider { enabled: false; minimum: -32; maximum: 40; value <=> root.eq-band-4; }
-                    Text { text: root.eq-band-4-label; vertical-alignment: center; width: 55px; }
+                    Text { text: root.eq-band-4-label; vertical-alignment: center; width: 55px; color: Palette.foreground; }
                 }
             }
-        }
 
-        HorizontalBox {
-            GroupBox {
-                title: "Crossfeed";
+            HorizontalLayout {
+                spacing: 14px;
+                Card {
+                    title: "Crossfeed";
+                    enabled: root.gaia-connected;
+                    horizontal-stretch: 1;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        PillButton {
+                            text: "Off";
+                            selected: root.crossfeed-selected == "off";
+                            horizontal-stretch: 1;
+                            clicked => { root.crossfeed-selected = "off"; root.crossfeed-set("off"); }
+                        }
+                        PillButton {
+                            text: "Low";
+                            selected: root.crossfeed-selected == "low";
+                            horizontal-stretch: 1;
+                            clicked => { root.crossfeed-selected = "low"; root.crossfeed-set("low"); }
+                        }
+                        PillButton {
+                            text: "High";
+                            selected: root.crossfeed-selected == "high";
+                            horizontal-stretch: 1;
+                            clicked => { root.crossfeed-selected = "high"; root.crossfeed-set("high"); }
+                        }
+                    }
+                }
+
+                Card {
+                    title: "Multipoint";
+                    enabled: root.gaia-connected;
+                    horizontal-stretch: 1;
+                    Caption { text: "Current: " + root.multipoint-status-text; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Switch {
+                            text: root.multipoint-on ? "On" : "Off";
+                            checked <=> root.multipoint-on;
+                            toggled => { root.multipoint-set(root.multipoint-on); }
+                        }
+                        Button { text: "Status"; clicked => { root.multipoint-status(); } }
+                    }
+                }
+            }
+
+            Card {
+                title: "Paired Devices";
                 enabled: root.gaia-connected;
-                HorizontalBox {
-                    Button {
-                        text: root.crossfeed-selected == "off" ? "● Off" : "Off";
-                        clicked => { root.crossfeed-selected = "off"; root.crossfeed-set("off"); }
+                Caption { text: "Reported by the headset itself (UNVERIFIED opcode) - not this machine's own Bluetooth pairing list."; }
+                VerticalLayout {
+                    spacing: 6px;
+                    for device in root.paired-devices: HorizontalLayout {
+                        spacing: 8px;
+                        Rectangle {
+                            width: 10px;
+                            height: 10px;
+                            border-radius: 5px;
+                            y: (parent.height - self.height) / 2;
+                            background: device.connected ? #4ade80 : #6b7280;
+                        }
+                        Text { text: device.name; vertical-alignment: center; color: Palette.foreground; }
                     }
-                    Button {
-                        text: root.crossfeed-selected == "low" ? "● Low" : "Low";
-                        clicked => { root.crossfeed-selected = "low"; root.crossfeed-set("low"); }
-                    }
-                    Button {
-                        text: root.crossfeed-selected == "high" ? "● High" : "High";
-                        clicked => { root.crossfeed-selected = "high"; root.crossfeed-set("high"); }
-                    }
+                    if root.paired-devices.length == 0: Caption { text: "No data yet - connect and press Refresh."; }
                 }
+                Button { text: "Refresh"; clicked => { root.refresh-paired-devices(); } }
             }
 
-            GroupBox {
-                title: "Multipoint";
+            Card {
+                title: "Device Info";
                 enabled: root.gaia-connected;
-                VerticalBox {
-                    Text { text: "Current: " + root.multipoint-status-text; wrap: word-wrap; }
-                    Switch {
-                        text: root.multipoint-on ? "On" : "Off";
-                        checked <=> root.multipoint-on;
-                        toggled => { root.multipoint-set(root.multipoint-on); }
+                Caption { text: root.device-info-text; }
+                Button { text: "Refresh"; clicked => { root.refresh-device-info(); } }
+            }
+
+            Card {
+                title: "More Settings";
+                enabled: root.gaia-connected;
+                Caption { text: "UNVERIFIED opcodes (third-party protocol writeup) - use with caution."; }
+                HorizontalLayout {
+                    spacing: 24px;
+                    VerticalLayout {
+                        spacing: 8px;
+                        horizontal-stretch: 1;
+                        HorizontalLayout {
+                            Text { text: "Smart Pause:"; vertical-alignment: center; color: Palette.foreground; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Switch { checked <=> root.smart-pause-on; toggled => { root.smart-pause-set(root.smart-pause-on); } }
+                        }
+                        HorizontalLayout {
+                            Text { text: "On-Head Detection:"; vertical-alignment: center; color: Palette.foreground; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Switch { checked <=> root.on-head-detection-on; toggled => { root.on-head-detection-set(root.on-head-detection-on); } }
+                        }
+                        HorizontalLayout {
+                            Text { text: "Auto-Answer:"; vertical-alignment: center; color: Palette.foreground; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Switch { checked <=> root.auto-answer-on; toggled => { root.auto-answer-set(root.auto-answer-on); } }
+                        }
+                        HorizontalLayout {
+                            Text { text: "Comfort Call:"; vertical-alignment: center; color: Palette.foreground; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Switch { checked <=> root.comfort-call-on; toggled => { root.comfort-call-set(root.comfort-call-on); } }
+                        }
                     }
-                    Button { text: "Status"; clicked => { root.multipoint-status(); } }
+                    VerticalLayout {
+                        spacing: 8px;
+                        horizontal-stretch: 1;
+                        HorizontalLayout {
+                            Text { text: "Low Latency:"; vertical-alignment: center; color: Palette.foreground; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Switch { checked <=> root.low-latency-on; toggled => { root.low-latency-set(root.low-latency-on); } }
+                        }
+                        HorizontalLayout {
+                            Text { text: "BT Compatibility:"; vertical-alignment: center; color: Palette.foreground; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Switch { checked <=> root.bt-compatibility-on; toggled => { root.bt-compatibility-set(root.bt-compatibility-on); } }
+                        }
+                        HorizontalLayout {
+                            Text { text: "Voice Prompt:"; vertical-alignment: center; color: Palette.foreground; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Switch { checked <=> root.voice-prompt-on; toggled => { root.voice-prompt-set(root.voice-prompt-on); } }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "Sidetone:"; vertical-alignment: center; width: 110px; color: Palette.foreground; }
+                    Slider {
+                        minimum: 0;
+                        maximum: 5;
+                        value <=> root.sidetone-level;
+                        changed(value) => { root.sidetone-set(round(value)); }
+                    }
+                    Text { text: round(root.sidetone-level); vertical-alignment: center; width: 24px; color: Palette.foreground; }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "Auto power-off (s):"; vertical-alignment: center; width: 110px; color: Palette.foreground; }
+                    Slider {
+                        minimum: 0;
+                        maximum: 3600;
+                        value <=> root.auto-power-off-seconds;
+                        changed(value) => { root.auto-power-off-set(round(value)); }
+                    }
+                    Text { text: round(root.auto-power-off-seconds); vertical-alignment: center; width: 50px; color: Palette.foreground; }
+                }
+                Button { text: "Refresh All"; clicked => { root.refresh-more-settings(); } }
+            }
+
+            Button {
+                text: root.advanced-visible ? "Hide Advanced" : "Show Advanced";
+                clicked => { root.advanced-visible = !root.advanced-visible; }
+            }
+
+            if root.advanced-visible: Card {
+                title: "Advanced: raw GAIA command";
+                enabled: root.gaia-connected;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "Vendor:"; vertical-alignment: center; color: Palette.foreground; }
+                    vendor-input := LineEdit { text: "0x0494"; width: 100px; }
+                    Text { text: "Command:"; vertical-alignment: center; color: Palette.foreground; }
+                    command-input := LineEdit { text: ""; width: 100px; }
+                    Text { text: "Payload (hex):"; vertical-alignment: center; color: Palette.foreground; }
+                    payload-input := LineEdit { text: ""; width: 140px; }
+                    Text { text: "Version:"; vertical-alignment: center; color: Palette.foreground; }
+                    version-input := LineEdit { text: "1"; width: 40px; }
+                    Button {
+                        text: "Send";
+                        clicked => {
+                            root.raw-gaia-send(vendor-input.text, command-input.text, payload-input.text, version-input.text);
+                        }
+                    }
                 }
             }
-        }
 
-        Button {
-            text: root.advanced-visible ? "Hide Advanced" : "Show Advanced";
-            clicked => { root.advanced-visible = !root.advanced-visible; }
-        }
-
-        if root.advanced-visible: GroupBox {
-            title: "Advanced: raw GAIA command";
-            enabled: root.gaia-connected;
-            HorizontalBox {
-                Text { text: "Vendor:"; vertical-alignment: center; }
-                vendor-input := LineEdit { text: "0x0494"; width: 100px; }
-                Text { text: "Command:"; vertical-alignment: center; }
-                command-input := LineEdit { text: ""; width: 100px; }
-                Text { text: "Payload (hex):"; vertical-alignment: center; }
-                payload-input := LineEdit { text: ""; width: 140px; }
-                Text { text: "Version:"; vertical-alignment: center; }
-                version-input := LineEdit { text: "1"; width: 40px; }
-                Button {
-                    text: "Send";
-                    clicked => {
-                        root.raw-gaia-send(vendor-input.text, command-input.text, payload-input.text, version-input.text);
+            if root.advanced-visible: Card {
+                title: "Log";
+                height: 220px;
+                ScrollView {
+                    TextEdit {
+                        text: root.log-text;
+                        read-only: true;
+                        wrap: word-wrap;
                     }
-                }
-            }
-        }
-
-        if root.advanced-visible: GroupBox {
-            title: "Log";
-            vertical-stretch: 1;
-            ScrollView {
-                TextEdit {
-                    text: root.log-text;
-                    read-only: true;
-                    wrap: word-wrap;
                 }
             }
         }

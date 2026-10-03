@@ -36,6 +36,35 @@ fn spawn<T, Fut>(
     });
 }
 
+/// Runs `action` on the UI thread after `delay`. Used right after connecting
+/// to let the connect-time live-push snapshot burst (registering for
+/// notifications - see `commands::register_for_live_status` - triggers
+/// roughly a dozen unsolicited frames within milliseconds) settle before
+/// firing a batched multi-GET query: `GaiaConnection::send` has no request
+/// ID to match a reply to its own request (see its docs), so a batched
+/// query issued too close to that burst can have one of its GETs misread a
+/// stray push as its answer instead of the real reply - confirmed live as
+/// the cause of `query_device_info`/`query_more_settings` sometimes coming
+/// back wrong immediately after connecting, correcting itself once
+/// "Refresh All" was pressed later (by which point the burst had settled).
+fn delayed_action(
+    rt: &tokio::runtime::Handle,
+    ui: &AppWindow,
+    delay: std::time::Duration,
+    action: impl FnOnce(&tokio::runtime::Handle, &AppWindow) + Send + 'static,
+) {
+    let rt_inner = rt.clone();
+    let ui_weak = ui.as_weak();
+    rt.spawn(async move {
+        tokio::time::sleep(delay).await;
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                action(&rt_inner, &ui);
+            }
+        });
+    });
+}
+
 fn append_log(ui: &AppWindow, line: impl AsRef<str>) {
     let mut text = ui.get_log_text().to_string();
     if !text.is_empty() {
@@ -326,6 +355,33 @@ fn main() -> Result<()> {
             }
         });
     }
+    {
+        let (rt, state) = (rt_handle.clone(), state.clone());
+        let ui_weak = ui.as_weak();
+        ui.on_refresh_paired_devices(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                query_paired_devices(&rt, &ui, state.lock().unwrap().gaia.clone());
+            }
+        });
+    }
+    {
+        let (rt, state) = (rt_handle.clone(), state.clone());
+        let ui_weak = ui.as_weak();
+        ui.on_refresh_device_info(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                query_device_info(&rt, &ui, state.lock().unwrap().gaia.clone());
+            }
+        });
+    }
+    {
+        let (rt, state) = (rt_handle.clone(), state.clone());
+        let ui_weak = ui.as_weak();
+        ui.on_refresh_more_settings(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                query_more_settings(&rt, &ui, state.lock().unwrap().gaia.clone());
+            }
+        });
+    }
 
     gaia_action!(
         on_anc_set,
@@ -424,6 +480,51 @@ fn main() -> Result<()> {
         |resp| format!("multipoint set: {}", format_gaia_response(&resp))
     );
     gaia_action!(
+        on_smart_pause_set,
+        |g, on: bool| commands::set_smart_pause(g, on).await,
+        |resp| format!("smart pause set: {}", format_gaia_response(&resp))
+    );
+    gaia_action!(
+        on_on_head_detection_set,
+        |g, on: bool| commands::set_on_head_detection(g, on).await,
+        |resp| format!("on-head detection set: {}", format_gaia_response(&resp))
+    );
+    gaia_action!(
+        on_auto_answer_set,
+        |g, on: bool| commands::set_auto_answer(g, on).await,
+        |resp| format!("auto-answer set: {}", format_gaia_response(&resp))
+    );
+    gaia_action!(
+        on_comfort_call_set,
+        |g, on: bool| commands::set_comfort_call(g, on).await,
+        |resp| format!("comfort call set: {}", format_gaia_response(&resp))
+    );
+    gaia_action!(
+        on_low_latency_set,
+        |g, on: bool| commands::set_low_latency(g, on).await,
+        |resp| format!("low latency set: {}", format_gaia_response(&resp))
+    );
+    gaia_action!(
+        on_bt_compatibility_set,
+        |g, on: bool| commands::set_bt_compatibility(g, on).await,
+        |resp| format!("bt compatibility set: {}", format_gaia_response(&resp))
+    );
+    gaia_action!(
+        on_voice_prompt_set,
+        |g, on: bool| commands::set_voice_prompt(g, on).await,
+        |resp| format!("voice prompt set: {}", format_gaia_response(&resp))
+    );
+    gaia_action!(
+        on_sidetone_set,
+        |g, level: i32| commands::set_sidetone(g, level.clamp(0, 5) as u8).await,
+        |resp| format!("sidetone set: {}", format_gaia_response(&resp))
+    );
+    gaia_action!(
+        on_auto_power_off_set,
+        |g, seconds: i32| commands::set_auto_power_off(g, seconds.clamp(0, u16::MAX as i32) as u16).await,
+        |resp| format!("auto power-off set: {}", format_gaia_response(&resp))
+    );
+    gaia_action!(
         on_noise_control_apply,
         |g, percent: i32| commands::set_noise_control_custom(g, percent.clamp(0, 100) as u8).await,
         |pair| format!("noise control set: {} / commit: {}", format_gaia_response(&pair.0), format_gaia_response(&pair.1))
@@ -497,6 +598,7 @@ fn spawn_gaia_notification_listener(
     gaia: Arc<AsyncMutex<Option<transport::GaiaConnection>>>,
 ) {
     let ui_weak = ui.as_weak();
+    let rt_inner = rt.clone();
     rt.spawn(async move {
         let mut receiver = {
             let mut guard = gaia.lock().await;
@@ -510,6 +612,18 @@ fn spawn_gaia_notification_listener(
                 Ok(resp) => {
                     let Some(event) = commands::interpret_event(&resp) else { continue };
                     let ui_weak = ui_weak.clone();
+                    // Unlike every other event, this one carries no usable
+                    // state of its own (see its docs) - re-query instead of
+                    // applying it directly.
+                    if matches!(event, commands::DeviceEvent::PairedDevicesChanged) {
+                        let (rt, gaia) = (rt_inner.clone(), gaia.clone());
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_weak.upgrade() {
+                                query_paired_devices(&rt, &ui, gaia);
+                            }
+                        });
+                        continue;
+                    }
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_weak.upgrade() {
                             apply_device_event(&ui, event);
@@ -531,7 +645,17 @@ fn spawn_gaia_notification_listener(
 fn apply_device_event(ui: &AppWindow, event: commands::DeviceEvent) {
     match event {
         commands::DeviceEvent::AncMode(on) => {
-            ui.set_anc_selected(if on { "adaptive" } else { "off" }.into());
+            // The firmware has no real "Custom" value for this param (see
+            // gaia::CMD_SONOVA_CUSTOM_NOISE_CONTROL_SET's docs) - entering
+            // Custom (crossfade + anti-wind) still provokes a normal
+            // Adaptive/Off confirmation here, which would otherwise
+            // immediately stomp the local "custom" selection the instant
+            // after picking it. Leaving Custom is instead driven by the
+            // Off/Adaptive buttons themselves (via leave-custom-anc in
+            // app.slint) or a live CustomModeActive(false) push - not this.
+            if !ui.get_anc_custom_visible() {
+                ui.set_anc_selected(if on { "adaptive" } else { "off" }.into());
+            }
             append_log(ui, format!("[live] ANC mode: {}", if on { "Adaptive" } else { "Off" }));
         }
         commands::DeviceEvent::AntiWind(on) => {
@@ -593,6 +717,10 @@ fn apply_device_event(ui: &AppWindow, event: commands::DeviceEvent) {
                 append_log(ui, format!("[live] eq bands match preset '{name}'"));
             }
         }
+        // Handled directly in spawn_gaia_notification_listener instead (it
+        // needs to trigger an async re-query, not just touch UI state) -
+        // this arm only exists for match exhaustiveness.
+        commands::DeviceEvent::PairedDevicesChanged => {}
     }
 }
 
@@ -634,6 +762,16 @@ fn connect_gaia(
                 query_anc_status(&rt_followup, ui, gaia_followup.clone());
                 query_multipoint_status(&rt_followup, ui, gaia_followup.clone());
                 query_crossfeed_status(&rt_followup, ui, gaia_followup.clone());
+                query_eq_status(&rt_followup, ui, gaia_followup.clone());
+                query_paired_devices(&rt_followup, ui, gaia_followup.clone());
+                // Delayed - see delayed_action's docs on why these two,
+                // each a multi-GET batch, are prone to misreads if fired
+                // too close to the connect-time snapshot burst.
+                let gaia_for_delay = gaia_followup.clone();
+                delayed_action(&rt_followup, ui, std::time::Duration::from_secs(1), move |rt, ui| {
+                    query_device_info(rt, ui, gaia_for_delay.clone());
+                    query_more_settings(rt, ui, gaia_for_delay);
+                });
                 spawn_gaia_notification_listener(&rt_followup, ui, gaia_followup);
             }
             Err(e) => {
@@ -781,6 +919,167 @@ fn query_crossfeed_status(rt: &tokio::runtime::Handle, ui: &AppWindow, gaia: Arc
             }
             Ok(None) => append_log(ui, "crossfeed status: device returned an unrecognized value"),
             Err(e) => append_log(ui, format!("crossfeed status error: {e:#}")),
+        },
+    );
+}
+
+/// Actively queries the current EQ curve (`commands::query_eq_bands`) right
+/// after connecting, instead of waiting on a push notification - see its
+/// docs for why this opcode is unverified-but-trusted.
+fn query_eq_status(rt: &tokio::runtime::Handle, ui: &AppWindow, gaia: Arc<AsyncMutex<Option<transport::GaiaConnection>>>) {
+    spawn(
+        rt,
+        ui,
+        async move {
+            let mut guard = gaia.lock().await;
+            let g = guard.as_mut().ok_or_else(|| anyhow!("not connected to a GAIA control channel"))?;
+            commands::query_eq_bands(g).await
+        },
+        |ui, result| match result {
+            // Reuses the live-push handler: it already sets the sliders,
+            // matches a preset name, and logs the gains - see its docs.
+            Ok(gains) => apply_device_event(ui, commands::DeviceEvent::EqBands(gains)),
+            Err(e) => append_log(ui, format!("eq status error: {e:#}")),
+        },
+    );
+}
+
+/// Queries the headset's own paired-device list (`commands::paired_devices`,
+/// riding on the unverified opcode documented at
+/// `gaia::CMD_SONOVA_PAIRED_DEVICE_GET`). Unlike the other `query_*`
+/// functions, not called automatically on every reconnect (no live-push/
+/// notification category is known for it) - only right after connecting
+/// and via the "Refresh" button.
+fn query_paired_devices(rt: &tokio::runtime::Handle, ui: &AppWindow, gaia: Arc<AsyncMutex<Option<transport::GaiaConnection>>>) {
+    spawn(
+        rt,
+        ui,
+        async move {
+            let mut guard = gaia.lock().await;
+            let g = guard.as_mut().ok_or_else(|| anyhow!("not connected to a GAIA control channel"))?;
+            commands::paired_devices(g).await
+        },
+        |ui, result| match result {
+            Ok(devices) => {
+                append_log(ui, format!("paired devices: {devices:?}"));
+                let infos: Vec<PairedDeviceInfo> =
+                    devices.into_iter().map(|d| PairedDeviceInfo { name: d.name.into(), connected: d.connected }).collect();
+                ui.set_paired_devices(infos.as_slice().into());
+            }
+            Err(e) => append_log(ui, format!("paired devices error: {e:#}")),
+        },
+    );
+}
+
+/// Queries battery/codec/model/firmware/hw-revision/serial in one go and
+/// renders them as a single multi-line string (simpler than one property per
+/// field - this is read-only display, not something a control binds to).
+/// UNVERIFIED opcodes - see `gaia::CMD_SONOVA_BATTERY_GET` docs and neighbors.
+#[allow(clippy::type_complexity)]
+fn query_device_info(rt: &tokio::runtime::Handle, ui: &AppWindow, gaia: Arc<AsyncMutex<Option<transport::GaiaConnection>>>) {
+    spawn(
+        rt,
+        ui,
+        async move {
+            let mut guard = gaia.lock().await;
+            let g = guard.as_mut().ok_or_else(|| anyhow!("not connected to a GAIA control channel"))?;
+            let battery = commands::battery_percent(g).await;
+            let codec = commands::codec_in_use(g).await;
+            let model = commands::model_id(g).await;
+            let firmware = commands::firmware_version(g).await;
+            let hw_revision = commands::hw_revision(g).await;
+            let serial = commands::serial_number(g).await;
+            Ok((battery, codec, model, firmware, hw_revision, serial))
+        },
+        |ui, result: Result<(Result<Option<u8>>, Result<Option<u8>>, Result<String>, Result<commands::FirmwareVersion>, Result<String>, Result<String>)>| {
+            match result {
+                Ok((battery, codec, model, firmware, hw_revision, serial)) => {
+                    let line = |label: &str, v: Result<String>| format!("{label}: {}", v.unwrap_or_else(|e| format!("error: {e:#}")));
+                    let text = [
+                        line("Battery", battery.map(|v| v.map_or("unknown".into(), |p| format!("{p}%")))),
+                        line("Codec", codec.map(|v| v.map_or("unknown".into(), |c| format!("{} ({c})", commands::codec_name(c))))),
+                        line("Model", model),
+                        line("Firmware", firmware.map(|v| v.to_string())),
+                        line("HW revision", hw_revision),
+                        line("Serial", serial),
+                    ]
+                    .join("\n");
+                    append_log(ui, format!("device info:\n{text}"));
+                    ui.set_device_info_text(text.into());
+                }
+                Err(e) => append_log(ui, format!("device info error: {e:#}")),
+            }
+        },
+    );
+}
+
+/// Queries every "more settings" toggle plus Sidetone/Auto-Power-Off in one
+/// go. UNVERIFIED opcodes - see `gaia::CMD_SONOVA_SMART_PAUSE_SET` docs and
+/// neighbors. Deliberately excludes Audio Mode/Prompt Language, whose SET
+/// side is confirmed broken - see their docs.
+#[allow(clippy::type_complexity)]
+fn query_more_settings(rt: &tokio::runtime::Handle, ui: &AppWindow, gaia: Arc<AsyncMutex<Option<transport::GaiaConnection>>>) {
+    spawn(
+        rt,
+        ui,
+        async move {
+            let mut guard = gaia.lock().await;
+            let g = guard.as_mut().ok_or_else(|| anyhow!("not connected to a GAIA control channel"))?;
+            Ok((
+                commands::smart_pause_status(g).await,
+                commands::on_head_detection_status(g).await,
+                commands::auto_answer_status(g).await,
+                commands::comfort_call_status(g).await,
+                commands::low_latency_status(g).await,
+                commands::bt_compatibility_status(g).await,
+                commands::voice_prompt_status(g).await,
+                commands::sidetone_level(g).await,
+                commands::auto_power_off_seconds(g).await,
+            ))
+        },
+        |ui,
+         result: Result<(
+            Result<Option<bool>>,
+            Result<Option<bool>>,
+            Result<Option<bool>>,
+            Result<Option<bool>>,
+            Result<Option<bool>>,
+            Result<Option<bool>>,
+            Result<Option<bool>>,
+            Result<Option<u8>>,
+            Result<Option<u16>>,
+        )>| match result {
+            Ok((smart_pause, on_head, auto_answer, comfort_call, low_latency, bt_compat, voice_prompt, sidetone, auto_power_off)) => {
+                if let Ok(Some(v)) = smart_pause {
+                    ui.set_smart_pause_on(v);
+                }
+                if let Ok(Some(v)) = on_head {
+                    ui.set_on_head_detection_on(v);
+                }
+                if let Ok(Some(v)) = auto_answer {
+                    ui.set_auto_answer_on(v);
+                }
+                if let Ok(Some(v)) = comfort_call {
+                    ui.set_comfort_call_on(v);
+                }
+                if let Ok(Some(v)) = low_latency {
+                    ui.set_low_latency_on(v);
+                }
+                if let Ok(Some(v)) = bt_compat {
+                    ui.set_bt_compatibility_on(v);
+                }
+                if let Ok(Some(v)) = voice_prompt {
+                    ui.set_voice_prompt_on(v);
+                }
+                if let Ok(Some(v)) = sidetone {
+                    ui.set_sidetone_level(v as f32);
+                }
+                if let Ok(Some(v)) = auto_power_off {
+                    ui.set_auto_power_off_seconds(v as f32);
+                }
+                append_log(ui, "more settings refreshed");
+            }
+            Err(e) => append_log(ui, format!("more settings error: {e:#}")),
         },
     );
 }

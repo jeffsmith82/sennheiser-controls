@@ -82,6 +82,41 @@ pub const CATEGORY_SONOVA_BASS_BOOST: u8 = 0x08;
 /// [`QUALCOMM_VENDOR_ID`], not Sonova's.
 pub const CATEGORY_QUALCOMM_MULTIPOINT: u8 = 0x07;
 
+/// VERIFIED against real hardware, under [`SONOVA_VENDOR_ID`]: the
+/// third-party protocol writeup's register-notification feature-id list
+/// (<https://github.com/Oein/sennheiser-desktop-client/blob/main/PROTOCOL.md>)
+/// names id `10` "deviceManagement" - confirmed live via the CLI's `listen`
+/// subcommand to push [`CMD_SONOVA_PAIRED_DEVICE_CONNECTION_CHANGED`] while
+/// disconnecting/reconnecting a paired phone (several bursts landed exactly
+/// when the user toggled the connection, timed 20-32s into a 60s listening
+/// window with nothing in between) - this is the live-push path
+/// [`crate::commands::paired_devices`] previously lacked entirely (only a
+/// manual re-query).
+pub const CATEGORY_SONOVA_DEVICE_MANAGEMENT: u8 = 0x0a;
+
+/// VERIFIED against real hardware (see [`CATEGORY_SONOVA_DEVICE_MANAGEMENT`]'s
+/// docs): a push-only notification, command ID `0x1484`. Payload is 1 byte;
+/// captured live as `[0x00]` and `[0x01]`, matching the two paired devices
+/// this project's own HDB 630 has (see [`CMD_SONOVA_PAIRED_DEVICE_GET`]) -
+/// almost certainly the index of whichever paired device's connection
+/// state just changed, NOT a plain on/off flag ([`GaiaResponse::status`]
+/// was `Some(1)` on every single capture, changed or not, so that byte
+/// looks like a generic ack, not the new state). Since this doesn't say
+/// what the NEW state is, [`crate::commands::paired_devices`] should be
+/// re-queried on receiving this, the same way `crossfeed_status` gets
+/// re-queried after a `CMD_SONOVA_CROSSFEED_SET` instead of trusting an
+/// inline value - not cross-checked against a 3rd paired device or a
+/// cleaner, single-event capture (the live test produced some lone `[0x00]`
+/// pushes with no paired `[0x01]`, not fully understood).
+///
+/// Unexplained: this is presumably the async-notification form
+/// (`request_id + 0x80`, per the third-party doc's stated convention) of a
+/// `0x1404` request this project has never sent and doesn't know the
+/// shape of - it falls in the gap between the documented `0x1403` and
+/// `0x1405` paired-device IDs, but what it actually requests (if anything
+/// useful) is unknown.
+pub const CMD_SONOVA_PAIRED_DEVICE_CONNECTION_CHANGED: u16 = 0x1484;
+
 /// VERIFIED against real hardware, under [`QUALCOMM_VENDOR_ID`] (not Sonova's
 /// vendor ID - see its docs). Payload is 1 byte: `0x00` off, `0x01` on.
 /// Confirmed across 3 on/off/on transitions, byte-for-byte identical every
@@ -98,18 +133,68 @@ pub const RSP_QUALCOMM_MULTIPOINT_SET: u16 = 0x0e80;
 /// query the app sends (empty payload) right after every multipoint change;
 /// the response, command ID `0x1509` (this ID + 0x100), carries a 1-byte
 /// payload: `0x02` when multipoint is on, `0x01` when off. This reports a
-/// count/capacity, not device identities - the headphones don't report
-/// *which* devices are connected or their names over GAIA at all. The
-/// app's "Connection Management" device list (names like "Pixel 6",
-/// "jeffpc") comes entirely from the phone's own Bluetooth pairing
-/// history, cross-referenced with this count - confirmed by capturing the
-/// screen being opened fresh, which sent no additional GAIA query at all.
+/// count/capacity of how many hosts are *currently connected* via
+/// multipoint, not device identities or how many are paired overall - see
+/// [`CMD_SONOVA_PAIRED_DEVICE_COUNT_GET`]/[`CMD_SONOVA_PAIRED_DEVICE_GET`]
+/// for that, a separate command pair this project originally missed (the
+/// app's own "Connection Management" screen doesn't use it - confirmed live
+/// that opening that screen sends no additional GAIA query at all, so the
+/// app sources that list from the phone's own Bluetooth pairing history
+/// instead, even though the headset can report it directly over GAIA too).
 pub const CMD_SONOVA_MULTIPOINT_STATUS_GET: u16 = 0x1409;
 
 /// The response ID for [`CMD_SONOVA_MULTIPOINT_STATUS_GET`] (`+ 0x100`) -
 /// see its docs. The count (`0x02`/`0x01`) lands in [`GaiaResponse::status`],
 /// not `payload` - see [`parse_packet`].
 pub const RSP_SONOVA_MULTIPOINT_STATUS_GET: u16 = 0x1509;
+
+/// VERIFIED against real hardware, under [`SONOVA_VENDOR_ID`]: an
+/// empty-payload GET returning the total number of devices paired/known to
+/// the headset (not just currently multipoint-connected ones - see
+/// [`CMD_SONOVA_MULTIPOINT_STATUS_GET`]). Response ID `0x1500` (this ID +
+/// 0x100); unlike most single-value replies in this file, the count is NOT
+/// the first extra byte - that byte is a separate, always-`0x00`-so-far
+/// status/ack code, and the real count is the first byte of
+/// [`GaiaResponse::payload`] (confirmed live: `status=Some(0)`,
+/// `payload=[0x02]` against this project's own HDB 630, matching its two
+/// real paired devices - see [`CMD_SONOVA_PAIRED_DEVICE_GET`]).
+///
+/// Command ID sourced from a third-party protocol writeup
+/// (<https://github.com/Oein/sennheiser-desktop-client/blob/main/PROTOCOL.md>,
+/// which lists `0x1400`-`0x1405` only as an undecoded "paired devices"
+/// cluster, with no payload/response detail) - decoded here by direct
+/// experimentation against real hardware.
+pub const CMD_SONOVA_PAIRED_DEVICE_COUNT_GET: u16 = 0x1400;
+pub const RSP_SONOVA_PAIRED_DEVICE_COUNT_GET: u16 = 0x1500;
+
+/// VERIFIED against real hardware, under [`SONOVA_VENDOR_ID`]: payload is 1
+/// byte, a 0-based device index (up to
+/// [`CMD_SONOVA_PAIRED_DEVICE_COUNT_GET`]'s count - 1). Reply command ID is
+/// `0x1501` (this ID + 0x100); `payload` is `[unknown_byte, connected_flag,
+/// name_bytes..., 0x00]` - a null-terminated ASCII name, preceded by TWO
+/// bytes, not one (easy to misread as one - this project's own first attempt
+/// did, before a second capture caught it).
+///
+/// Decoded from two devices across two separate capture sessions:
+///
+/// | index | name | `status` | `payload[0]` | `payload[1]` (session 1 -> 2) |
+/// |---|---|---|---|---|
+/// | 0 | "jeffpc" (this machine) | `0` | `0` | `1` -> `1` |
+/// | 1 | "Pixel 6" | `1` | `1` | `0` -> `1` |
+///
+/// [`GaiaResponse::status`] and `payload[0]` were identical to each other
+/// and constant per device across both sessions (always matching the
+/// index, for whatever that's worth with only 2 data points) - neither is
+/// used by [`crate::commands::paired_devices`], which tracks the index
+/// itself instead. `payload[1]` is the only byte that actually changed
+/// between sessions, and only for "Pixel 6" (the phone, presumably
+/// connecting/disconnecting in the background) while "jeffpc" (this
+/// machine, definitely connected both times since it's what's making the
+/// query) stayed `1` throughout - strong evidence `payload[1]` is a real
+/// "currently connected" flag, though still UNCONFIRMED against a 3rd
+/// device or a controlled connect/disconnect test.
+pub const CMD_SONOVA_PAIRED_DEVICE_GET: u16 = 0x1401;
+pub const RSP_SONOVA_PAIRED_DEVICE_GET: u16 = 0x1501;
 
 /// VERIFIED against real hardware (see module docs). This is really a
 /// general "set a noise-control parameter" command, not ANC-specific -
@@ -311,6 +396,23 @@ pub const EQ_PRESETS: &[(&str, [i8; 5])] = &[
     ("jazz", [-32, 0, 22, 22, 0]),
 ];
 
+/// UNVERIFIED against this project's own live captures - unlike everything
+/// else in this file, sourced from a third-party reverse-engineering writeup
+/// (<https://github.com/Oein/sennheiser-desktop-client/blob/main/PROTOCOL.md>)
+/// rather than our own HCI snoop sessions. That doc's EQ section otherwise
+/// matches [`CMD_SONOVA_EQ_SET_BAND`]/[`RSP_SONOVA_EQ_SET_BAND`] byte-for-byte
+/// (confirmed independently against the same HDB 630 hardware), which is why
+/// this is trusted enough to wire up rather than left as a raw/manual-only
+/// command.
+///
+/// An explicit "GET band" request: payload is 1 byte (the band index 0-4),
+/// reply is 1 byte (the gain, same `i8`-in-a-`u8` encoding as the SET side).
+/// Lets a caller read the current EQ curve on demand - e.g. right after
+/// connecting - instead of only ever learning it from a push notification
+/// (which requires registering [`CATEGORY_SONOVA_BASS_BOOST`] first and then
+/// waiting for something to trigger a [`RSP_SONOVA_EQ_SET_BAND`] snapshot).
+pub const CMD_SONOVA_EQ_GET_BAND: u16 = 0x1002;
+
 /// VERIFIED against real hardware (see module docs): captured via a fourth
 /// HCI snoop session, cycling Crossfeed through Off -> Low -> High. Single
 /// command, payload is 1 byte. Unlike every other verified command here, the
@@ -339,6 +441,118 @@ pub const CMD_SONOVA_CROSSFEED_GET: u16 = 0x2e01;
 /// Uses the same non-sequential encoding as [`CMD_SONOVA_CROSSFEED_SET`]
 /// (`CROSSFEED_OFF`/`CROSSFEED_LOW`/`CROSSFEED_HIGH`).
 pub const RSP_SONOVA_CROSSFEED_GET: u16 = 0x2f01;
+
+// --- Everything below this point (through the end of the "toggles" group)
+// is UNVERIFIED against this project's own live captures - sourced from the
+// same third-party protocol writeup as CMD_SONOVA_EQ_GET_BAND/
+// CMD_SONOVA_PAIRED_DEVICE_GET above
+// (<https://github.com/Oein/sennheiser-desktop-client/blob/main/PROTOCOL.md>),
+// which documents these against ACCENTUM hardware (same GAIA stack, same
+// vendor ID, independently confirmed to share opcodes with this project's
+// HDB 630 for EQ/paired-devices). Response IDs follow that doc's stated
+// convention (request + 0x100), which was NOT the case for every command
+// this project verified itself (e.g. CMD_SONOVA_ANC_SET's response is
+// + 0x81) - so even the response ID for each of these should be treated as
+// a guess until a live reply actually arrives there.
+
+/// GET only. Battery percentage, 0-100. Response `0x0703` (`+ 0x100`);
+/// per the doc, also pushed unprompted as notification `0x0683` (`+ 0x80`),
+/// unconfirmed which [`CMD_REGISTER_NOTIFICATION`] category (if any) that
+/// needs.
+pub const CMD_SONOVA_BATTERY_GET: u16 = 0x0603;
+
+/// GET only. Codec currently in use - the doc gives one example value (`5`
+/// = aptX-HD) but no full enum. Response `0x0900`.
+pub const CMD_SONOVA_CODEC_GET: u16 = 0x0800;
+
+/// GET only. Null-terminated ASCII model name string (e.g. `"MMMMBT
+/// Black"` in the doc's own capture, against different hardware - expect
+/// something HDB-630-specific here). Response `0x1306`.
+pub const CMD_SONOVA_MODEL_ID_GET: u16 = 0x1206;
+
+/// GET only. Firmware version as 3x `u16` (major/minor/patch, 6 bytes
+/// total). Response `0x1301`.
+pub const CMD_SONOVA_FIRMWARE_VERSION_GET: u16 = 0x1201;
+
+/// GET only. Response `0x1300` (confirmed live - unlike most of this
+/// section, the response ID guess was right). Payload is 3 raw bytes,
+/// `[major, minor, patch]` (confirmed live returning `[3, 0, 0]` against
+/// this project's own HDB 630) - NOT a null-terminated string like
+/// [`CMD_SONOVA_MODEL_ID_GET`], despite looking similar on paper; a first
+/// attempt assumed it was and got garbage.
+pub const CMD_SONOVA_HW_REVISION_GET: u16 = 0x1200;
+
+/// GET only, under [`QUALCOMM_VENDOR_ID`] (not Sonova's) - the doc lists
+/// this as `001D:0003`. Serial number, shape undocumented.
+pub const CMD_QUALCOMM_SERIAL_GET: u16 = 0x0003;
+
+/// SET `[level]` (0-5) / GET. Sidetone (hear your own voice through the
+/// headset while on a call) volume level.
+pub const CMD_SONOVA_SIDETONE_SET: u16 = 0x0805;
+pub const CMD_SONOVA_SIDETONE_GET: u16 = 0x0806;
+
+/// SET `[0/1]` / GET. "Smart Pause" - auto-pause playback when the
+/// headset is removed.
+pub const CMD_SONOVA_SMART_PAUSE_SET: u16 = 0x080c;
+pub const CMD_SONOVA_SMART_PAUSE_GET: u16 = 0x080d;
+
+/// SET `[0/1]` / GET. On-Head Detection.
+pub const CMD_SONOVA_ON_HEAD_DETECTION_SET: u16 = 0x0400;
+pub const CMD_SONOVA_ON_HEAD_DETECTION_GET: u16 = 0x0401;
+
+/// SET `[0/1]` / GET. Auto-Answer incoming calls.
+pub const CMD_SONOVA_AUTO_ANSWER_SET: u16 = 0x080a;
+pub const CMD_SONOVA_AUTO_ANSWER_GET: u16 = 0x080b;
+
+/// SET `[0/1]` / GET. "Comfort Call" (the doc gives no further detail on
+/// what this changes).
+pub const CMD_SONOVA_COMFORT_CALL_SET: u16 = 0x0814;
+pub const CMD_SONOVA_COMFORT_CALL_GET: u16 = 0x0815;
+
+/// SET `[0/1]` / GET. Low Latency (gaming) mode.
+pub const CMD_SONOVA_LOW_LATENCY_SET: u16 = 0x0817;
+pub const CMD_SONOVA_LOW_LATENCY_GET: u16 = 0x0818;
+
+/// SET `[0/1]` / GET. "BT Compatibility" mode (the doc gives no further
+/// detail - likely a codec/connection-robustness compatibility toggle for
+/// older host devices).
+pub const CMD_SONOVA_BT_COMPATIBILITY_SET: u16 = 0x0405;
+pub const CMD_SONOVA_BT_COMPATIBILITY_GET: u16 = 0x0406;
+
+/// GET confirmed live (returned `0`, plausibly "music" with `2` = podcast
+/// per the doc). SET did NOT work as documented: `[0x00, 0x00]` (mode 0,
+/// its own current value) got GAIA's standard error-response ID (`0x0983`,
+/// this ID + 0x180) with a non-standard status code (128 - the usual GAIA
+/// error codes are 0-7), so the payload shape or opcode itself is wrong in
+/// some way not yet worked out. Left in as GET-only until that's resolved -
+/// see [`crate::commands::set_audio_mode`]'s docs.
+pub const CMD_SONOVA_AUDIO_MODE_SET: u16 = 0x0803;
+pub const CMD_SONOVA_AUDIO_MODE_GET: u16 = 0x0804;
+
+/// SET `[0/1]` / GET. Voice/tone prompts (the spoken or beeped feedback
+/// for button presses etc).
+pub const CMD_SONOVA_VOICE_PROMPT_SET: u16 = 0x0801;
+pub const CMD_SONOVA_VOICE_PROMPT_GET: u16 = 0x0802;
+
+/// Confirmed live NOT to work with a bare 1-byte index payload: `[0x00]`
+/// got GAIA's standard INVALID_PARAMETER error response. The doc gives no
+/// payload shape at all for this one (unlike every SET/GET pair above,
+/// which at least state the argument), so the real shape (wider index?
+/// different field order?) isn't worked out yet - treat as broken/
+/// untrusted, not just "unverified", until someone does.
+pub const CMD_SONOVA_PROMPT_LANGUAGE_SET: u16 = 0x0807;
+
+/// SET `[timer_id (always 0 in the doc's example), value_u16]`. GET also
+/// needs that same leading `[timer_id]` byte - confirmed live, an
+/// empty-payload GET got GAIA's standard error response (status code 5,
+/// INVALID_PARAMETER) until a `[0x00]` payload was tried, which then
+/// returned `value_u16 = 0x0384` (900). The doc doesn't state `value_u16`'s
+/// unit, and this project's first guess ("minutes") would make that a
+/// 15-hour timeout - implausible next to 900 **seconds** (15 minutes), a
+/// far more ordinary auto-off default, so seconds is the current best guess,
+/// still UNCONFIRMED.
+pub const CMD_SONOVA_AUTO_POWER_OFF_SET: u16 = 0x0600;
+pub const CMD_SONOVA_AUTO_POWER_OFF_GET: u16 = 0x0601;
 
 /// Sennheiser electronic GmbH's own (older) GAIA vendor ID, reverse
 /// engineered from the original (pre-Sonova-acquisition) Sennheiser Android

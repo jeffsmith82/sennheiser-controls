@@ -99,10 +99,9 @@ enum Command {
         percent: u8,
     },
     /// Turn multipoint (connecting to 2 devices at once) on or off, or check
-    /// its status (VERIFIED against real HDB 630 hardware). Note: the
-    /// headphones only report a device COUNT over GAIA, not device
-    /// identities - there is no GAIA command for "list of connected
-    /// devices with names"; use `bluez-devices` for that (see its help).
+    /// its status (VERIFIED against real HDB 630 hardware). This only
+    /// reports how many hosts are currently connected, not their identities -
+    /// see `paired-devices` for the headset's own named device list.
     Multipoint {
         /// Which physical channel to send the command over
         #[arg(long, value_enum, default_value = "classic")]
@@ -112,11 +111,18 @@ enum Command {
     },
     /// List every Bluetooth device currently connected to THIS machine
     /// (standard BlueZ Device1.Connected - not a GAIA/headphone-specific
-    /// query). This is the closest equivalent to "list of connected
-    /// devices" available: the headphones themselves only report how many
-    /// hosts are connected via multipoint (see `multipoint status`), not
-    /// which ones or their names.
+    /// query). See also `paired-devices`, which asks the headset itself.
     BluezDevices,
+    /// List devices paired to the headset itself, by name (VERIFIED against
+    /// real HDB 630 hardware, but UNVERIFIED opcodes 0x1400/0x1401 - sourced
+    /// from a third-party protocol writeup with no decode detail, decoded
+    /// here by direct experimentation; see `gaia::CMD_SONOVA_PAIRED_DEVICE_GET`
+    /// docs for caveats, particularly around the "connected" flag's meaning).
+    PairedDevices {
+        /// Which physical channel to send the command over
+        #[arg(long, value_enum, default_value = "classic")]
+        transport: transport::TransportKind,
+    },
     /// Turn Anti-wind (wind noise reduction in ANC) on or off (VERIFIED
     /// against real HDB 630 hardware).
     AntiWind {
@@ -133,6 +139,105 @@ enum Command {
         transport: transport::TransportKind,
         #[command(subcommand)]
         action: CrossfeedAction,
+    },
+    /// Read device info: battery %, codec, model, firmware version, HW
+    /// revision, serial (UNVERIFIED opcodes - sourced from a third-party
+    /// protocol writeup, not this project's own captures; see
+    /// `gaia::CMD_SONOVA_BATTERY_GET` docs and neighbors).
+    DeviceInfo {
+        #[arg(long, value_enum, default_value = "classic")]
+        transport: transport::TransportKind,
+    },
+    /// Sidetone (hear your own voice during calls) level 0-5 (UNVERIFIED opcode).
+    Sidetone {
+        #[arg(long, value_enum, default_value = "classic")]
+        transport: transport::TransportKind,
+        #[command(subcommand)]
+        action: LevelAction,
+    },
+    /// Smart Pause: auto-pause playback when the headset is removed (UNVERIFIED opcode).
+    SmartPause {
+        #[arg(long, value_enum, default_value = "classic")]
+        transport: transport::TransportKind,
+        #[command(subcommand)]
+        action: ToggleAction,
+    },
+    /// On-Head Detection (UNVERIFIED opcode).
+    OnHeadDetection {
+        #[arg(long, value_enum, default_value = "classic")]
+        transport: transport::TransportKind,
+        #[command(subcommand)]
+        action: ToggleAction,
+    },
+    /// Auto-Answer incoming calls (UNVERIFIED opcode).
+    AutoAnswer {
+        #[arg(long, value_enum, default_value = "classic")]
+        transport: transport::TransportKind,
+        #[command(subcommand)]
+        action: ToggleAction,
+    },
+    /// "Comfort Call" (UNVERIFIED opcode, no further detail known about what it changes).
+    ComfortCall {
+        #[arg(long, value_enum, default_value = "classic")]
+        transport: transport::TransportKind,
+        #[command(subcommand)]
+        action: ToggleAction,
+    },
+    /// Low Latency (gaming) mode (UNVERIFIED opcode).
+    LowLatency {
+        #[arg(long, value_enum, default_value = "classic")]
+        transport: transport::TransportKind,
+        #[command(subcommand)]
+        action: ToggleAction,
+    },
+    /// "BT Compatibility" mode (UNVERIFIED opcode, no further detail known).
+    BtCompatibility {
+        #[arg(long, value_enum, default_value = "classic")]
+        transport: transport::TransportKind,
+        #[command(subcommand)]
+        action: ToggleAction,
+    },
+    /// Audio/Podcast mode (UNVERIFIED opcode; known value: 2 = podcast).
+    AudioMode {
+        #[arg(long, value_enum, default_value = "classic")]
+        transport: transport::TransportKind,
+        #[command(subcommand)]
+        action: AudioModeAction,
+    },
+    /// Voice/tone prompts (UNVERIFIED opcode).
+    VoicePrompt {
+        #[arg(long, value_enum, default_value = "classic")]
+        transport: transport::TransportKind,
+        #[command(subcommand)]
+        action: ToggleAction,
+    },
+    /// Voice prompt language, by index (UNVERIFIED opcode, SET only - see
+    /// `gaia::CMD_SONOVA_PROMPT_LANGUAGE_SET` docs).
+    PromptLanguage {
+        #[arg(long, value_enum, default_value = "classic")]
+        transport: transport::TransportKind,
+        index: u8,
+    },
+    /// Auto Power-Off timer, in seconds (UNVERIFIED opcode AND unit - see
+    /// `gaia::CMD_SONOVA_AUTO_POWER_OFF_GET` docs).
+    AutoPowerOff {
+        #[arg(long, value_enum, default_value = "classic")]
+        transport: transport::TransportKind,
+        #[command(subcommand)]
+        action: AutoPowerOffAction,
+    },
+    /// Connects, registers for live-push notifications (including the
+    /// UNTESTED `deviceManagement` category - see
+    /// `gaia::CATEGORY_SONOVA_DEVICE_MANAGEMENT`), then prints every raw
+    /// frame the headset sends for a window of time. For reverse-engineering
+    /// what pushes unprompted (e.g. do something to the device - like
+    /// disconnecting a paired phone - while this runs).
+    Listen {
+        #[arg(long, value_enum, default_value = "classic")]
+        transport: transport::TransportKind,
+        /// How long to listen before exiting
+        #[arg(long, default_value_t = 60)]
+        seconds: u64,
     },
     /// Send an arbitrary raw GAIA command over the control channel
     /// (advanced / for experimenting with opcodes this tool doesn't know about).
@@ -210,6 +315,38 @@ enum CrossfeedAction {
     High,
 }
 
+/// Shared by every simple SET `[0/1]` / GET boolean setting added from the
+/// third-party protocol writeup (Smart Pause, On-Head Detection,
+/// Auto-Answer, Comfort Call, Low Latency, BT Compatibility, Voice Prompt).
+#[derive(Subcommand)]
+enum ToggleAction {
+    On,
+    Off,
+    Status,
+}
+
+#[derive(Subcommand)]
+enum LevelAction {
+    /// Set the level directly (e.g. Sidetone, 0-5)
+    Set { level: u8 },
+    Status,
+}
+
+#[derive(Subcommand)]
+enum AudioModeAction {
+    /// Set the raw mode byte (known value: 2 = podcast)
+    Set { mode: u8 },
+    Status,
+}
+
+#[derive(Subcommand)]
+enum AutoPowerOffAction {
+    /// Set the timer, in seconds (unit UNCONFIRMED - see
+    /// `gaia::CMD_SONOVA_AUTO_POWER_OFF_GET` docs)
+    Set { seconds: u16 },
+    Status,
+}
+
 #[derive(Subcommand)]
 enum EqAction {
     /// Apply a named preset: neutral, speech-clarity, rock, pop, dance,
@@ -223,6 +360,10 @@ enum EqAction {
         /// Signed gain value, e.g. -20 or 25
         gain: i8,
     },
+    /// Read the current 5-band gain curve from the device (UNVERIFIED opcode
+    /// 0x1002 - sourced from a third-party protocol writeup, not this
+    /// project's own captures; see `gaia::CMD_SONOVA_EQ_GET_BAND` docs)
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -238,6 +379,13 @@ enum TransparencyAction {
 fn print_volume(name: &str, volume: u16) {
     let pct = volume as u32 * 100 / bluez::MAX_VOLUME as u32;
     println!("{name}: {volume}/{} ({pct}%)", bluez::MAX_VOLUME);
+}
+
+fn print_toggle_status(name: &str, label: &str, value: Option<bool>) {
+    match value {
+        Some(v) => println!("{name}: {label} = {}", if v { "on" } else { "off" }),
+        None => println!("{name}: {label} reply had no value"),
+    }
 }
 
 fn print_gaia_response(name: &str, resp: &gaia::GaiaResponse) {
@@ -350,6 +498,14 @@ async fn main() -> Result<()> {
                     let resp = commands::set_eq_band(&mut gaia_conn, band, gain).await?;
                     print_gaia_response(&name, &resp);
                 }
+                EqAction::Status => {
+                    let gains = commands::query_eq_bands(&mut gaia_conn).await?;
+                    println!("{name}: eq bands = {gains:?}");
+                    match commands::find_eq_preset(gains) {
+                        Some((_, preset)) => println!("{name}: matches preset '{preset}'"),
+                        None => println!("{name}: does not match any known preset"),
+                    }
+                }
             }
         }
         Command::NoiseControlCustom { transport, percent } => {
@@ -385,6 +541,17 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::PairedDevices { transport } => {
+            let (name, mut gaia_conn) = bluez::open_gaia_connection(&conn, cli.device.as_deref(), transport).await?;
+            let devices = commands::paired_devices(&mut gaia_conn).await?;
+            if devices.is_empty() {
+                println!("{name}: no paired devices reported");
+            } else {
+                for d in devices {
+                    println!("{name}: [{}] {} (connected: {})", d.index, d.name, d.connected);
+                }
+            }
+        }
         Command::AntiWind { transport, action } => {
             let (name, mut gaia_conn) = bluez::open_gaia_connection(&conn, cli.device.as_deref(), transport).await?;
             let resp = commands::set_anti_wind(&mut gaia_conn, matches!(action, AntiWindAction::On)).await?;
@@ -399,6 +566,184 @@ async fn main() -> Result<()> {
             };
             let resp = commands::set_crossfeed(&mut gaia_conn, level).await?;
             print_gaia_response(&name, &resp);
+        }
+        Command::DeviceInfo { transport } => {
+            let (name, mut gaia_conn) = bluez::open_gaia_connection(&conn, cli.device.as_deref(), transport).await?;
+            match commands::battery_percent(&mut gaia_conn).await {
+                Ok(Some(pct)) => println!("{name}: battery = {pct}%"),
+                Ok(None) => println!("{name}: battery reply had no value"),
+                Err(e) => println!("{name}: battery error: {e:#}"),
+            }
+            match commands::codec_in_use(&mut gaia_conn).await {
+                Ok(Some(codec)) => println!("{name}: codec = {} ({codec})", commands::codec_name(codec)),
+                Ok(None) => println!("{name}: codec reply had no value"),
+                Err(e) => println!("{name}: codec error: {e:#}"),
+            }
+            match commands::model_id(&mut gaia_conn).await {
+                Ok(model) => println!("{name}: model = {model:?}"),
+                Err(e) => println!("{name}: model error: {e:#}"),
+            }
+            match commands::firmware_version(&mut gaia_conn).await {
+                Ok(fw) => println!("{name}: firmware = {fw}"),
+                Err(e) => println!("{name}: firmware error: {e:#}"),
+            }
+            match commands::hw_revision(&mut gaia_conn).await {
+                Ok(rev) => println!("{name}: hw revision = {rev}"),
+                Err(e) => println!("{name}: hw revision error: {e:#}"),
+            }
+            match commands::serial_number(&mut gaia_conn).await {
+                Ok(serial) => println!("{name}: serial = {serial:?}"),
+                Err(e) => println!("{name}: serial error: {e:#}"),
+            }
+        }
+        Command::Sidetone { transport, action } => {
+            let (name, mut gaia_conn) = bluez::open_gaia_connection(&conn, cli.device.as_deref(), transport).await?;
+            match action {
+                LevelAction::Set { level } => {
+                    let resp = commands::set_sidetone(&mut gaia_conn, level).await?;
+                    print_gaia_response(&name, &resp);
+                }
+                LevelAction::Status => match commands::sidetone_level(&mut gaia_conn).await? {
+                    Some(level) => println!("{name}: sidetone level = {level}"),
+                    None => println!("{name}: sidetone reply had no value"),
+                },
+            }
+        }
+        Command::SmartPause { transport, action } => {
+            let (name, mut gaia_conn) = bluez::open_gaia_connection(&conn, cli.device.as_deref(), transport).await?;
+            match action {
+                ToggleAction::Status => print_toggle_status(&name, "smart pause", commands::smart_pause_status(&mut gaia_conn).await?),
+                on_off => {
+                    let resp = commands::set_smart_pause(&mut gaia_conn, matches!(on_off, ToggleAction::On)).await?;
+                    print_gaia_response(&name, &resp);
+                }
+            }
+        }
+        Command::OnHeadDetection { transport, action } => {
+            let (name, mut gaia_conn) = bluez::open_gaia_connection(&conn, cli.device.as_deref(), transport).await?;
+            match action {
+                ToggleAction::Status => {
+                    print_toggle_status(&name, "on-head detection", commands::on_head_detection_status(&mut gaia_conn).await?)
+                }
+                on_off => {
+                    let resp = commands::set_on_head_detection(&mut gaia_conn, matches!(on_off, ToggleAction::On)).await?;
+                    print_gaia_response(&name, &resp);
+                }
+            }
+        }
+        Command::AutoAnswer { transport, action } => {
+            let (name, mut gaia_conn) = bluez::open_gaia_connection(&conn, cli.device.as_deref(), transport).await?;
+            match action {
+                ToggleAction::Status => print_toggle_status(&name, "auto-answer", commands::auto_answer_status(&mut gaia_conn).await?),
+                on_off => {
+                    let resp = commands::set_auto_answer(&mut gaia_conn, matches!(on_off, ToggleAction::On)).await?;
+                    print_gaia_response(&name, &resp);
+                }
+            }
+        }
+        Command::ComfortCall { transport, action } => {
+            let (name, mut gaia_conn) = bluez::open_gaia_connection(&conn, cli.device.as_deref(), transport).await?;
+            match action {
+                ToggleAction::Status => print_toggle_status(&name, "comfort call", commands::comfort_call_status(&mut gaia_conn).await?),
+                on_off => {
+                    let resp = commands::set_comfort_call(&mut gaia_conn, matches!(on_off, ToggleAction::On)).await?;
+                    print_gaia_response(&name, &resp);
+                }
+            }
+        }
+        Command::LowLatency { transport, action } => {
+            let (name, mut gaia_conn) = bluez::open_gaia_connection(&conn, cli.device.as_deref(), transport).await?;
+            match action {
+                ToggleAction::Status => print_toggle_status(&name, "low latency", commands::low_latency_status(&mut gaia_conn).await?),
+                on_off => {
+                    let resp = commands::set_low_latency(&mut gaia_conn, matches!(on_off, ToggleAction::On)).await?;
+                    print_gaia_response(&name, &resp);
+                }
+            }
+        }
+        Command::BtCompatibility { transport, action } => {
+            let (name, mut gaia_conn) = bluez::open_gaia_connection(&conn, cli.device.as_deref(), transport).await?;
+            match action {
+                ToggleAction::Status => {
+                    print_toggle_status(&name, "bt compatibility", commands::bt_compatibility_status(&mut gaia_conn).await?)
+                }
+                on_off => {
+                    let resp = commands::set_bt_compatibility(&mut gaia_conn, matches!(on_off, ToggleAction::On)).await?;
+                    print_gaia_response(&name, &resp);
+                }
+            }
+        }
+        Command::AudioMode { transport, action } => {
+            let (name, mut gaia_conn) = bluez::open_gaia_connection(&conn, cli.device.as_deref(), transport).await?;
+            match action {
+                AudioModeAction::Set { mode } => {
+                    let resp = commands::set_audio_mode(&mut gaia_conn, mode).await?;
+                    print_gaia_response(&name, &resp);
+                }
+                AudioModeAction::Status => match commands::audio_mode(&mut gaia_conn).await? {
+                    Some(mode) => println!("{name}: audio mode = {mode}"),
+                    None => println!("{name}: audio mode reply had no value"),
+                },
+            }
+        }
+        Command::VoicePrompt { transport, action } => {
+            let (name, mut gaia_conn) = bluez::open_gaia_connection(&conn, cli.device.as_deref(), transport).await?;
+            match action {
+                ToggleAction::Status => print_toggle_status(&name, "voice prompt", commands::voice_prompt_status(&mut gaia_conn).await?),
+                on_off => {
+                    let resp = commands::set_voice_prompt(&mut gaia_conn, matches!(on_off, ToggleAction::On)).await?;
+                    print_gaia_response(&name, &resp);
+                }
+            }
+        }
+        Command::PromptLanguage { transport, index } => {
+            let (name, mut gaia_conn) = bluez::open_gaia_connection(&conn, cli.device.as_deref(), transport).await?;
+            let resp = commands::set_prompt_language(&mut gaia_conn, index).await?;
+            print_gaia_response(&name, &resp);
+        }
+        Command::AutoPowerOff { transport, action } => {
+            let (name, mut gaia_conn) = bluez::open_gaia_connection(&conn, cli.device.as_deref(), transport).await?;
+            match action {
+                AutoPowerOffAction::Set { seconds } => {
+                    let resp = commands::set_auto_power_off(&mut gaia_conn, seconds).await?;
+                    print_gaia_response(&name, &resp);
+                }
+                AutoPowerOffAction::Status => match commands::auto_power_off_seconds(&mut gaia_conn).await? {
+                    Some(seconds) => println!("{name}: auto power-off = {seconds} seconds"),
+                    None => println!("{name}: auto power-off reply had no value"),
+                },
+            }
+        }
+        Command::Listen { transport, seconds } => {
+            let (name, mut gaia_conn) = bluez::open_gaia_connection(&conn, cli.device.as_deref(), transport).await?;
+            commands::register_for_live_status(&mut gaia_conn).await?;
+            // Extra, not-yet-trusted registration this command exists to
+            // test - see gaia::CATEGORY_SONOVA_DEVICE_MANAGEMENT's docs.
+            gaia_conn
+                .send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_REGISTER_NOTIFICATION, &[gaia::CATEGORY_SONOVA_DEVICE_MANAGEMENT])
+                .await?;
+            let mut receiver = gaia_conn.subscribe();
+            println!("{name}: listening for {seconds}s - do something to the device now (e.g. disconnect/reconnect a paired phone)...");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, receiver.recv()).await {
+                    Ok(Ok(resp)) => println!(
+                        "[{:>6.1}s] vendor=0x{:04x} command=0x{:04x} status={:?} payload={:02x?}",
+                        seconds as f64 - remaining.as_secs_f64(),
+                        resp.vendor_id,
+                        resp.command_id,
+                        resp.status,
+                        resp.payload
+                    ),
+                    Ok(Err(e)) => println!("notification channel error: {e:#}"),
+                    Err(_timeout) => break,
+                }
+            }
+            println!("{name}: done listening.");
         }
         Command::Gaia { transport, vendor, command, payload, version } => {
             let vendor_id = gaia::parse_hex_u16(&vendor).context("invalid --vendor")?;

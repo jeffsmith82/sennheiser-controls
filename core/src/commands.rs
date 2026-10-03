@@ -6,7 +6,7 @@
 
 use crate::gaia::{self, GaiaResponse};
 use crate::transport::GaiaConnection;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 
 pub async fn anc_status(gaia: &mut GaiaConnection) -> Result<GaiaResponse> {
     gaia.send(1, gaia::SENNHEISER_VENDOR_ID, gaia::CMD_ANC_GET, &[]).await
@@ -62,6 +62,27 @@ pub async fn set_eq_preset(gaia: &mut GaiaConnection, name: &str) -> Result<Vec<
     Ok(results)
 }
 
+/// Actively reads the current gain of all 5 EQ bands via
+/// [`gaia::CMD_SONOVA_EQ_GET_BAND`], one band at a time - unlike learning the
+/// EQ curve only from a [`DeviceEvent::EqBands`] push (which needs something
+/// to trigger it after registering [`gaia::CATEGORY_SONOVA_BASS_BOOST`]),
+/// this lets a caller query it immediately, e.g. right after connecting.
+///
+/// [`gaia::CMD_SONOVA_EQ_GET_BAND`] itself is UNVERIFIED against this
+/// project's own captures (sourced from a third-party protocol writeup) -
+/// see its docs.
+pub async fn query_eq_bands(gaia: &mut GaiaConnection) -> Result<[i8; 5]> {
+    let mut gains = [0i8; 5];
+    for (band, gain) in gains.iter_mut().enumerate() {
+        let resp = gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_EQ_GET_BAND, &[band as u8]).await?;
+        *gain = resp
+            .status
+            .ok_or_else(|| anyhow!("CMD_SONOVA_EQ_GET_BAND reply for band {band} had no gain byte"))?
+            as i8;
+    }
+    Ok(gains)
+}
+
 /// Finds the [`gaia::EQ_PRESETS`] entry whose 5 band gains exactly match
 /// `gains`, for matching a [`DeviceEvent::EqBands`] snapshot back to a named
 /// preset - there's no real "get current preset name" opcode, only the raw
@@ -84,9 +105,11 @@ pub async fn set_multipoint(gaia: &mut GaiaConnection, on: bool) -> Result<GaiaR
     gaia.send(3, gaia::QUALCOMM_VENDOR_ID, gaia::CMD_QUALCOMM_MULTIPOINT_SET, &[state]).await
 }
 
-/// The headphones only report a device COUNT over GAIA, not device
-/// identities - there is no GAIA command for "list of connected devices
-/// with names".
+/// The headphones only report over how many hosts are *currently connected*
+/// via multipoint, not their identities - see [`paired_devices`] for the
+/// separate command pair that does report names (this project's earlier
+/// claim that no such GAIA command existed at all was wrong - see
+/// [`gaia::CMD_SONOVA_MULTIPOINT_STATUS_GET`] docs).
 #[derive(Debug, Clone, Copy)]
 pub enum MultipointStatus {
     On,
@@ -105,6 +128,260 @@ pub async fn multipoint_status(gaia: &mut GaiaConnection) -> Result<MultipointSt
         Some(other) => MultipointStatus::Unknown(other),
         None => MultipointStatus::NoValue,
     })
+}
+
+/// One entry from [`paired_devices`] - a device the headset itself knows
+/// about (paired, not necessarily currently connected).
+#[derive(Debug, Clone)]
+pub struct PairedDevice {
+    pub index: u8,
+    /// UNCONFIRMED guess at "currently connected" - see
+    /// [`gaia::CMD_SONOVA_PAIRED_DEVICE_GET`] docs.
+    pub connected: bool,
+    pub name: String,
+}
+
+/// Reads the headset's own list of paired devices (by name, not just a bare
+/// count) via [`gaia::CMD_SONOVA_PAIRED_DEVICE_COUNT_GET`] +
+/// [`gaia::CMD_SONOVA_PAIRED_DEVICE_GET`] - discovered by direct
+/// experimentation after a third-party protocol writeup listed the command
+/// IDs with no decode detail (see their docs). Distinct from
+/// [`multipoint_status`], which only reports a currently-connected count,
+/// not identities.
+pub async fn paired_devices(gaia: &mut GaiaConnection) -> Result<Vec<PairedDevice>> {
+    let count_resp = gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_PAIRED_DEVICE_COUNT_GET, &[]).await?;
+    // The count is the first PAYLOAD byte here, not `status` (which is a
+    // separate, always-0x00-so-far ack byte) - see
+    // gaia::CMD_SONOVA_PAIRED_DEVICE_COUNT_GET's docs.
+    let count = *count_resp.payload.first().ok_or_else(|| anyhow!("paired device count reply had no count byte"))?;
+
+    let mut devices = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let resp = gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_PAIRED_DEVICE_GET, &[index]).await?;
+        // payload is [unknown_byte, connected_flag, name_bytes..., 0x00] -
+        // see gaia::CMD_SONOVA_PAIRED_DEVICE_GET's docs for how the flag's
+        // position was pinned down (an off-by-one from a first, wrong
+        // capture).
+        let flag = *resp
+            .payload
+            .get(1)
+            .ok_or_else(|| anyhow!("paired device {index} reply had no connected-flag byte"))?;
+        let name = String::from_utf8_lossy(resp.payload.get(2..).unwrap_or(&[])).trim_end_matches('\0').to_string();
+        devices.push(PairedDevice { index, connected: flag == 1, name });
+    }
+    Ok(devices)
+}
+
+// --- Everything below this point, through the end of this section, wraps
+// opcodes documented in `gaia`'s "UNVERIFIED against this project's own live
+// captures" block (sourced from a third-party protocol writeup) - treat
+// every one of these functions as unverified too, including the response
+// shape each one assumes, until tested live.
+
+async fn set_toggle(gaia: &mut GaiaConnection, command_id: u16, on: bool) -> Result<GaiaResponse> {
+    gaia.send(3, gaia::SONOVA_VENDOR_ID, command_id, &[on as u8]).await
+}
+
+/// Assumes the reply's value lands in `status`, matching every verified
+/// single-byte reply elsewhere in this file - but note `paired_devices`'s
+/// count reply broke that exact assumption (the value was in `payload[0]`
+/// instead), so treat `None` here as "check `resp.payload` too", not
+/// necessarily "no value".
+async fn get_toggle(gaia: &mut GaiaConnection, command_id: u16) -> Result<Option<bool>> {
+    let resp = gaia.send(3, gaia::SONOVA_VENDOR_ID, command_id, &[]).await?;
+    Ok(resp.status.map(|s| s == 1))
+}
+
+/// Concatenates `status` (if present) ahead of `payload` and strips a
+/// trailing NUL - a guess at how this device's string replies (model id, HW
+/// revision, serial) are shaped, modeled on how `paired_devices`' names
+/// turned out to be encoded. Unlike that command, this hasn't been
+/// cross-checked against a live capture yet.
+fn decode_string_reply(resp: &GaiaResponse) -> String {
+    let mut bytes = Vec::with_capacity(1 + resp.payload.len());
+    if let Some(status) = resp.status {
+        bytes.push(status);
+    }
+    bytes.extend_from_slice(&resp.payload);
+    String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_string()
+}
+
+pub async fn battery_percent(gaia: &mut GaiaConnection) -> Result<Option<u8>> {
+    Ok(gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_BATTERY_GET, &[]).await?.status)
+}
+
+/// The raw byte is returned as-is for the caller to display/map - see
+/// [`codec_name`] for a human-readable label.
+pub async fn codec_in_use(gaia: &mut GaiaConnection) -> Result<Option<u8>> {
+    Ok(gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_CODEC_GET, &[]).await?.status)
+}
+
+/// Maps a raw [`codec_in_use`] value to a name - from the user's own direct
+/// testing/recollection with this device, not a formal capture like the
+/// rest of this file's "UNVERIFIED" opcodes (the third-party doc this
+/// project otherwise relies on only documented one value, `5` = aptX-HD,
+/// which this agrees with). `0` is listed for both SBC and SBC-XQ in the
+/// user's own account - rather than a device bug, this is presumably one
+/// base codec ID with SBC-XQ being a higher-bitpool/quality variant of
+/// plain SBC that this single byte can't distinguish on its own.
+pub fn codec_name(value: u8) -> &'static str {
+    match value {
+        0 => "SBC / SBC-XQ",
+        1 => "AAC",
+        2 => "aptX",
+        5 => "aptX-HD",
+        _ => "unknown",
+    }
+}
+
+pub async fn model_id(gaia: &mut GaiaConnection) -> Result<String> {
+    let resp = gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_MODEL_ID_GET, &[]).await?;
+    Ok(decode_string_reply(&resp))
+}
+
+/// VERIFIED against real hardware: unlike `model_id`/`serial_number`, this
+/// is `[major, minor, patch]` raw bytes, not a string - see
+/// `gaia::CMD_SONOVA_HW_REVISION_GET`'s docs.
+pub async fn hw_revision(gaia: &mut GaiaConnection) -> Result<String> {
+    let resp = gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_HW_REVISION_GET, &[]).await?;
+    let payload = &resp.payload;
+    if payload.len() < 3 {
+        bail!("hw revision reply too short ({} bytes, need 3): {payload:02x?}", payload.len());
+    }
+    Ok(format!("{}.{}.{}", payload[0], payload[1], payload[2]))
+}
+
+pub async fn serial_number(gaia: &mut GaiaConnection) -> Result<String> {
+    let resp = gaia.send(3, gaia::QUALCOMM_VENDOR_ID, gaia::CMD_QUALCOMM_SERIAL_GET, &[]).await?;
+    Ok(decode_string_reply(&resp))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FirmwareVersion {
+    pub major: u16,
+    pub minor: u16,
+    pub patch: u16,
+}
+
+impl std::fmt::Display for FirmwareVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// Assumes big-endian 3x `u16`, matching every other multi-byte field in
+/// this protocol (vendor/command IDs are big-endian) - the doc doesn't say.
+pub async fn firmware_version(gaia: &mut GaiaConnection) -> Result<FirmwareVersion> {
+    let resp = gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_FIRMWARE_VERSION_GET, &[]).await?;
+    let mut bytes = Vec::with_capacity(1 + resp.payload.len());
+    if let Some(status) = resp.status {
+        bytes.push(status);
+    }
+    bytes.extend_from_slice(&resp.payload);
+    if bytes.len() < 6 {
+        bail!("firmware version reply too short ({} bytes, need 6): {bytes:02x?}", bytes.len());
+    }
+    Ok(FirmwareVersion {
+        major: u16::from_be_bytes([bytes[0], bytes[1]]),
+        minor: u16::from_be_bytes([bytes[2], bytes[3]]),
+        patch: u16::from_be_bytes([bytes[4], bytes[5]]),
+    })
+}
+
+pub async fn set_sidetone(gaia: &mut GaiaConnection, level: u8) -> Result<GaiaResponse> {
+    gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_SIDETONE_SET, &[level]).await
+}
+
+pub async fn sidetone_level(gaia: &mut GaiaConnection) -> Result<Option<u8>> {
+    Ok(gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_SIDETONE_GET, &[]).await?.status)
+}
+
+pub async fn set_smart_pause(gaia: &mut GaiaConnection, on: bool) -> Result<GaiaResponse> {
+    set_toggle(gaia, gaia::CMD_SONOVA_SMART_PAUSE_SET, on).await
+}
+pub async fn smart_pause_status(gaia: &mut GaiaConnection) -> Result<Option<bool>> {
+    get_toggle(gaia, gaia::CMD_SONOVA_SMART_PAUSE_GET).await
+}
+
+pub async fn set_on_head_detection(gaia: &mut GaiaConnection, on: bool) -> Result<GaiaResponse> {
+    set_toggle(gaia, gaia::CMD_SONOVA_ON_HEAD_DETECTION_SET, on).await
+}
+pub async fn on_head_detection_status(gaia: &mut GaiaConnection) -> Result<Option<bool>> {
+    get_toggle(gaia, gaia::CMD_SONOVA_ON_HEAD_DETECTION_GET).await
+}
+
+pub async fn set_auto_answer(gaia: &mut GaiaConnection, on: bool) -> Result<GaiaResponse> {
+    set_toggle(gaia, gaia::CMD_SONOVA_AUTO_ANSWER_SET, on).await
+}
+pub async fn auto_answer_status(gaia: &mut GaiaConnection) -> Result<Option<bool>> {
+    get_toggle(gaia, gaia::CMD_SONOVA_AUTO_ANSWER_GET).await
+}
+
+pub async fn set_comfort_call(gaia: &mut GaiaConnection, on: bool) -> Result<GaiaResponse> {
+    set_toggle(gaia, gaia::CMD_SONOVA_COMFORT_CALL_SET, on).await
+}
+pub async fn comfort_call_status(gaia: &mut GaiaConnection) -> Result<Option<bool>> {
+    get_toggle(gaia, gaia::CMD_SONOVA_COMFORT_CALL_GET).await
+}
+
+pub async fn set_low_latency(gaia: &mut GaiaConnection, on: bool) -> Result<GaiaResponse> {
+    set_toggle(gaia, gaia::CMD_SONOVA_LOW_LATENCY_SET, on).await
+}
+pub async fn low_latency_status(gaia: &mut GaiaConnection) -> Result<Option<bool>> {
+    get_toggle(gaia, gaia::CMD_SONOVA_LOW_LATENCY_GET).await
+}
+
+pub async fn set_bt_compatibility(gaia: &mut GaiaConnection, on: bool) -> Result<GaiaResponse> {
+    set_toggle(gaia, gaia::CMD_SONOVA_BT_COMPATIBILITY_SET, on).await
+}
+pub async fn bt_compatibility_status(gaia: &mut GaiaConnection) -> Result<Option<bool>> {
+    get_toggle(gaia, gaia::CMD_SONOVA_BT_COMPATIBILITY_GET).await
+}
+
+/// CONFIRMED LIVE NOT TO WORK as documented - see
+/// [`gaia::CMD_SONOVA_AUDIO_MODE_SET`]'s docs. Kept callable (e.g. for the
+/// CLI's raw `gaia` command / future investigation) but not wired into the
+/// GUI.
+pub async fn set_audio_mode(gaia: &mut GaiaConnection, mode: u8) -> Result<GaiaResponse> {
+    gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_AUDIO_MODE_SET, &[0x00, mode]).await
+}
+pub async fn audio_mode(gaia: &mut GaiaConnection) -> Result<Option<u8>> {
+    Ok(gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_AUDIO_MODE_GET, &[]).await?.status)
+}
+
+pub async fn set_voice_prompt(gaia: &mut GaiaConnection, on: bool) -> Result<GaiaResponse> {
+    set_toggle(gaia, gaia::CMD_SONOVA_VOICE_PROMPT_SET, on).await
+}
+pub async fn voice_prompt_status(gaia: &mut GaiaConnection) -> Result<Option<bool>> {
+    get_toggle(gaia, gaia::CMD_SONOVA_VOICE_PROMPT_GET).await
+}
+
+/// CONFIRMED LIVE NOT TO WORK with a bare index byte - see
+/// [`gaia::CMD_SONOVA_PROMPT_LANGUAGE_SET`]'s docs. Kept callable but not
+/// wired into the GUI.
+pub async fn set_prompt_language(gaia: &mut GaiaConnection, index: u8) -> Result<GaiaResponse> {
+    gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_PROMPT_LANGUAGE_SET, &[index]).await
+}
+
+/// `seconds` - see [`gaia::CMD_SONOVA_AUTO_POWER_OFF_GET`]'s docs on why
+/// that unit (not minutes) is the current best guess.
+pub async fn set_auto_power_off(gaia: &mut GaiaConnection, seconds: u16) -> Result<GaiaResponse> {
+    let mut payload = vec![0x00]; // timer_id - always 0 in the doc's own example
+    payload.extend_from_slice(&seconds.to_be_bytes());
+    gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_AUTO_POWER_OFF_SET, &payload).await
+}
+
+/// VERIFIED (partially) against real hardware: the GET needs the same
+/// leading `[timer_id]` byte the SET side does (confirmed live - an
+/// empty-payload GET errors) - this always queries timer 0, matching the
+/// doc's own example. Returns seconds - see
+/// [`gaia::CMD_SONOVA_AUTO_POWER_OFF_GET`]'s docs on the unit guess.
+pub async fn auto_power_off_seconds(gaia: &mut GaiaConnection) -> Result<Option<u16>> {
+    let resp = gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_AUTO_POWER_OFF_GET, &[0x00]).await?;
+    if resp.payload.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(u16::from_be_bytes([resp.payload[0], resp.payload[1]])))
 }
 
 pub async fn set_anti_wind(gaia: &mut GaiaConnection, on: bool) -> Result<GaiaResponse> {
@@ -165,6 +442,8 @@ pub async fn register_for_live_status(gaia: &mut GaiaConnection) -> Result<()> {
     gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_REGISTER_NOTIFICATION, &[gaia::CATEGORY_SONOVA_BASS_BOOST]).await?;
     gaia.send(3, gaia::QUALCOMM_VENDOR_ID, gaia::CMD_REGISTER_NOTIFICATION, &[gaia::CATEGORY_QUALCOMM_MULTIPOINT])
         .await?;
+    gaia.send(3, gaia::SONOVA_VENDOR_ID, gaia::CMD_REGISTER_NOTIFICATION, &[gaia::CATEGORY_SONOVA_DEVICE_MANAGEMENT])
+        .await?;
     Ok(())
 }
 
@@ -193,6 +472,11 @@ pub enum DeviceEvent {
     /// docs for how band 0 (in `status`) and bands 1-4 (in `payload`) get
     /// reassembled into this.
     EqBands([i8; 5]),
+    /// A paired device's connection state changed - see
+    /// [`gaia::CMD_SONOVA_PAIRED_DEVICE_CONNECTION_CHANGED`]'s docs on why
+    /// this doesn't carry the new state itself: callers should re-query
+    /// [`paired_devices`] on receiving this.
+    PairedDevicesChanged,
 }
 
 /// Decodes a raw GAIA frame into a [`DeviceEvent`] if it's one this library
@@ -252,6 +536,7 @@ pub fn interpret_event(resp: &GaiaResponse) -> Option<DeviceEvent> {
                 other => MultipointStatus::Unknown(other),
             }))
         }
+        (gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_PAIRED_DEVICE_CONNECTION_CHANGED) => Some(DeviceEvent::PairedDevicesChanged),
         _ => None,
     }
 }
@@ -413,6 +698,16 @@ mod tests {
 
         let unexpected = resp(gaia::SONOVA_VENDOR_ID, gaia::RSP_SONOVA_MULTIPOINT_STATUS_GET, Some(9), &[]);
         assert!(matches!(interpret_event(&unexpected), Some(DeviceEvent::MultipointStatus(MultipointStatus::Unknown(9)))));
+    }
+
+    #[test]
+    fn interpret_event_decodes_paired_devices_changed_from_real_capture() {
+        // Real capture: pushed while disconnecting/reconnecting a paired
+        // phone (see gaia::CMD_SONOVA_PAIRED_DEVICE_CONNECTION_CHANGED
+        // docs) - payload content (device index) is deliberately not
+        // decoded here, only that this is a "something changed" signal.
+        let r = resp(gaia::SONOVA_VENDOR_ID, gaia::CMD_SONOVA_PAIRED_DEVICE_CONNECTION_CHANGED, Some(1), &[0x01]);
+        assert!(matches!(interpret_event(&r), Some(DeviceEvent::PairedDevicesChanged)));
     }
 
     #[test]
